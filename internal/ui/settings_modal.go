@@ -23,10 +23,15 @@ var (
 )
 
 // SettingsModal manages the state of the API & Workspace configuration dialog.
+// It edits an isolated draft copy of AppConfig so cancelling the dialog does not
+// leave unsaved mutations in live application state.
 type SettingsModal struct {
 	Open       bool
 	ActiveTab  int
 	ShowAPIKey bool
+
+	editing bool
+	draft   store.AppConfig
 
 	// New target draft fields
 	NewTargetRemote  bool
@@ -37,6 +42,15 @@ type SettingsModal struct {
 
 // Render draws the settings modal when Open is true.
 func (s *SettingsModal) Render(c *ui.Context, cfg *store.AppConfig, onApply func()) {
+	if !s.Open {
+		s.editing = false
+		return
+	}
+	if !s.editing {
+		s.draft = cfg.Clone()
+		s.editing = true
+	}
+
 	ui.Modal(c, &s.Open, func() {
 		t := c.Theme()
 		ui.Column(c).Width(580).Gap(14).Children(func() {
@@ -45,6 +59,7 @@ func (s *SettingsModal) Render(c *ui.Context, cfg *store.AppConfig, onApply func
 				ui.Spacer(c)
 				if ui.Button(c, "✕").Clicked() {
 					s.Open = false
+					s.editing = false
 				}
 			})
 
@@ -52,9 +67,9 @@ func (s *SettingsModal) Render(c *ui.Context, cfg *store.AppConfig, onApply func
 			ui.Divider(c)
 
 			if s.ActiveTab == 0 {
-				s.renderProviderTab(c, cfg, onApply)
+				s.renderProviderTab(c, &s.draft)
 			} else {
-				s.renderTargetsTab(c, cfg, onApply)
+				s.renderTargetsTab(c, &s.draft, cfg, onApply)
 			}
 
 			ui.Divider(c)
@@ -62,26 +77,45 @@ func (s *SettingsModal) Render(c *ui.Context, cfg *store.AppConfig, onApply func
 				ui.Text(c, "配置文件: "+store.ConfigPath()).FontSize(11).TextColor(t.TextMuted)
 				ui.Spacer(c)
 				if ui.PrimaryButton(c, "保存并生效").Clicked() {
-					_ = cfg.Save()
-					if onApply != nil {
-						onApply()
-					}
+					s.commitToConfig(cfg, onApply)
 					s.Open = false
+					s.editing = false
 					c.Toast("配置已保存并立即生效")
 				}
 			})
 		})
 	})
+
+	if !s.Open {
+		s.editing = false
+	}
 }
 
-func (s *SettingsModal) renderProviderTab(c *ui.Context, cfg *store.AppConfig, onApply func()) {
+func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func()) {
+	cfg.ActiveProfileID = s.draft.ActiveProfileID
+	cfg.Profiles = make([]store.ProviderProfile, len(s.draft.Profiles))
+	copy(cfg.Profiles, s.draft.Profiles)
+
+	cfg.ActiveTargetID = s.draft.ActiveTargetID
+	cfg.Targets = make([]store.WorkspaceTarget, len(s.draft.Targets))
+	copy(cfg.Targets, s.draft.Targets)
+
+	_ = cfg.ActiveProfile()
+	_ = cfg.ActiveTarget()
+	_ = cfg.Save()
+	if onApply != nil {
+		onApply()
+	}
+}
+
+func (s *SettingsModal) renderProviderTab(c *ui.Context, draft *store.AppConfig) {
 	t := c.Theme()
 
 	// Profile selector row
 	ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-		for i := range cfg.Profiles {
-			p := &cfg.Profiles[i]
-			active := p.ID == cfg.ActiveProfileID
+		for i := range draft.Profiles {
+			p := &draft.Profiles[i]
+			active := p.ID == draft.ActiveProfileID
 			var btn ui.Element
 			if active {
 				btn = ui.PrimaryButton(c, p.Name)
@@ -89,13 +123,13 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, cfg *store.AppConfig, o
 				btn = ui.Button(c, p.Name)
 			}
 			if btn.Clicked() {
-				cfg.ActiveProfileID = p.ID
+				draft.ActiveProfileID = p.ID
 			}
 		}
 		ui.Spacer(c)
 		if ui.Button(c, "+ 新增预设").Clicked() {
 			id := fmt.Sprintf("custom-%d", time.Now().Unix()%10000)
-			cfg.Profiles = append(cfg.Profiles, store.ProviderProfile{
+			draft.Profiles = append(draft.Profiles, store.ProviderProfile{
 				ID:            id,
 				Name:          "自定义接口",
 				Format:        store.FormatOpenAICompletions,
@@ -103,11 +137,11 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, cfg *store.AppConfig, o
 				ModelID:       "gpt-4.1",
 				ThinkingLevel: "medium",
 			})
-			cfg.ActiveProfileID = id
+			draft.ActiveProfileID = id
 		}
 	})
 
-	prof := cfg.ActiveProfile()
+	prof := draft.ActiveProfile()
 	if prof == nil {
 		return
 	}
@@ -181,7 +215,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, cfg *store.AppConfig, o
 	})
 }
 
-func (s *SettingsModal) renderTargetsTab(c *ui.Context, cfg *store.AppConfig, onApply func()) {
+func (s *SettingsModal) renderTargetsTab(c *ui.Context, draft *store.AppConfig, liveCfg *store.AppConfig, onApply func()) {
 	t := c.Theme()
 
 	ui.Column(c).FillWidth().Gap(10).Children(func() {
@@ -189,8 +223,8 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, cfg *store.AppConfig, on
 
 		ui.Scroll(c).MaxHeight(180).FillWidth().Children(func() {
 			ui.Column(c).FillWidth().Gap(6).Children(func() {
-				for i := range cfg.Targets {
-					wt := &cfg.Targets[i]
+				for i := range draft.Targets {
+					wt := &draft.Targets[i]
 					tag := "💻 Local"
 					sub := wt.WorkDir
 					if wt.IsRemote {
@@ -201,10 +235,14 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, cfg *store.AppConfig, on
 						ui.Badge(c, tag)
 						ui.Text(c, wt.Name).Bold().FontSize(12)
 						ui.Text(c, sub).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine().Ellipsis("...")
-						if len(cfg.Targets) > 1 && i > 0 {
+						if len(draft.Targets) > 1 && i > 0 {
 							idx := i
 							if ui.Button(c, "删除").Clicked() {
-								cfg.Targets = append(cfg.Targets[:idx], cfg.Targets[idx+1:]...)
+								removedID := draft.Targets[idx].ID
+								draft.Targets = append(draft.Targets[:idx], draft.Targets[idx+1:]...)
+								if draft.ActiveTargetID == removedID {
+									_ = draft.ActiveTarget()
+								}
 							}
 						}
 					})
@@ -236,6 +274,9 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, cfg *store.AppConfig, on
 				if workDir == "" && s.NewTargetRemote {
 					workDir = "~"
 				}
+				if !s.NewTargetRemote && workDir != "" {
+					workDir = store.ExpandLocalPath(workDir)
+				}
 				if workDir != "" && (!s.NewTargetRemote || sshHost != "") {
 					if name == "" {
 						if s.NewTargetRemote {
@@ -245,17 +286,22 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, cfg *store.AppConfig, on
 						}
 					}
 					id := fmt.Sprintf("target-%d", time.Now().UnixNano()%100000)
-					cfg.Targets = append(cfg.Targets, store.WorkspaceTarget{
+					newTarget := store.WorkspaceTarget{
 						ID:       id,
 						Name:     name,
 						IsRemote: s.NewTargetRemote,
 						WorkDir:  workDir,
 						SSHHost:  sshHost,
-					})
+					}
+					draft.Targets = append(draft.Targets, newTarget)
+					liveCfg.Targets = append(liveCfg.Targets, newTarget)
 					s.NewTargetName = ""
 					s.NewTargetWorkDir = ""
 					s.NewTargetSSHHost = ""
-					_ = cfg.Save()
+					_ = liveCfg.Save()
+					if onApply != nil {
+						onApply()
+					}
 				}
 			}
 		})

@@ -37,16 +37,21 @@ type WorkspaceTarget struct {
 	SSHHost  string `json:"ssh_host,omitempty"` // ~/.ssh/config alias or user@host:port
 }
 
-// AppConfig is persisted to ~/.config/piui/config.json.
+// AppConfig is persisted to ~/.config/piui/config.json (or PIUI_CONFIG_PATH).
 type AppConfig struct {
 	ActiveProfileID string            `json:"active_profile_id"`
 	Profiles        []ProviderProfile `json:"profiles"`
 	ActiveTargetID  string            `json:"active_target_id"`
 	Targets         []WorkspaceTarget `json:"targets"`
+
+	configPath string `json:"-"`
 }
 
-// ConfigPath returns the path to ~/.config/piui/config.json.
+// ConfigPath returns the path to ~/.config/piui/config.json, honoring PIUI_CONFIG_PATH if set.
 func ConfigPath() string {
+	if envPath := strings.TrimSpace(os.Getenv("PIUI_CONFIG_PATH")); envPath != "" {
+		return ExpandLocalPath(envPath)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return "piui-config.json"
@@ -54,20 +59,41 @@ func ConfigPath() string {
 	return filepath.Join(home, ".config", "piui", "config.json")
 }
 
-// LoadOrInit loads ~/.config/piui/config.json or creates sensible defaults.
+// ExpandLocalPath expands a leading "~" or "~/" to the local user's home directory.
+func ExpandLocalPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
+// LoadOrInit loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) or creates sensible defaults.
 func LoadOrInit(defaultWorkDir string) *AppConfig {
 	if defaultWorkDir == "" {
 		defaultWorkDir, _ = os.Getwd()
 	}
+	defaultWorkDir = ExpandLocalPath(defaultWorkDir)
+	if abs, err := filepath.Abs(defaultWorkDir); err == nil {
+		defaultWorkDir = abs
+	}
+
 	path := ConfigPath()
 	data, err := os.ReadFile(path)
 	var cfg AppConfig
 	if err == nil && json.Unmarshal(data, &cfg) == nil && len(cfg.Profiles) > 0 {
+		cfg.configPath = path
 		cfg.ensureTargets(defaultWorkDir)
 		return &cfg
 	}
 
 	cfg = AppConfig{
+		configPath:      path,
 		ActiveProfileID: "anthropic-default",
 		Profiles: []ProviderProfile{
 			{
@@ -104,23 +130,39 @@ func LoadOrInit(defaultWorkDir string) *AppConfig {
 	return &cfg
 }
 
+// Clone returns a deep copy of AppConfig suitable for modal draft editing.
+func (c *AppConfig) Clone() AppConfig {
+	if c == nil {
+		return AppConfig{}
+	}
+	cp := *c
+	cp.Profiles = make([]ProviderProfile, len(c.Profiles))
+	copy(cp.Profiles, c.Profiles)
+	cp.Targets = make([]WorkspaceTarget, len(c.Targets))
+	copy(cp.Targets, c.Targets)
+	return cp
+}
+
 func (c *AppConfig) ensureTargets(defaultWorkDir string) {
-	hasLocal := false
-	for _, t := range c.Targets {
-		if !t.IsRemote {
-			hasLocal = true
-			break
+	localCwdTarget := WorkspaceTarget{
+		ID:       "local-cwd",
+		Name:     "本机当前目录 (" + filepath.Base(defaultWorkDir) + ")",
+		IsRemote: false,
+		WorkDir:  defaultWorkDir,
+	}
+
+	foundLocalCwd := false
+	for i := range c.Targets {
+		if !c.Targets[i].IsRemote && c.Targets[i].WorkDir != "" {
+			c.Targets[i].WorkDir = ExpandLocalPath(c.Targets[i].WorkDir)
+		}
+		if c.Targets[i].ID == "local-cwd" {
+			c.Targets[i] = localCwdTarget
+			foundLocalCwd = true
 		}
 	}
-	if !hasLocal {
-		c.Targets = append([]WorkspaceTarget{
-			{
-				ID:       "local-cwd",
-				Name:     "本机当前目录 (" + filepath.Base(defaultWorkDir) + ")",
-				IsRemote: false,
-				WorkDir:  defaultWorkDir,
-			},
-		}, c.Targets...)
+	if !foundLocalCwd {
+		c.Targets = append([]WorkspaceTarget{localCwdTarget}, c.Targets...)
 	}
 
 	// Merge SSH hosts discovered from ~/.ssh/config if not already present.
@@ -143,14 +185,26 @@ func (c *AppConfig) ensureTargets(defaultWorkDir string) {
 		})
 	}
 
-	if c.ActiveTargetID == "" && len(c.Targets) > 0 {
+	// Ensure ActiveTargetID references an existing target.
+	validActive := false
+	for _, t := range c.Targets {
+		if t.ID == c.ActiveTargetID {
+			validActive = true
+			break
+		}
+	}
+	if !validActive && len(c.Targets) > 0 {
 		c.ActiveTargetID = c.Targets[0].ID
 	}
 }
 
-// Save writes the configuration to ~/.config/piui/config.json.
+// Save writes the configuration to ~/.config/piui/config.json (or the configured path).
 func (c *AppConfig) Save() error {
-	path := ConfigPath()
+	path := c.configPath
+	if path == "" {
+		path = ConfigPath()
+		c.configPath = path
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

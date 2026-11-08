@@ -35,6 +35,8 @@ func NewManager(baseCwd string, cfg *store.AppConfig, termSink TerminalStreamSin
 	if baseCwd == "" {
 		baseCwd, _ = os.Getwd()
 	}
+	baseCwd = store.ExpandLocalPath(baseCwd)
+
 	initialTarget := store.WorkspaceTarget{
 		ID:      "local-cwd",
 		Name:    "Local",
@@ -73,20 +75,24 @@ func (m *Manager) buildModelAndRuntime(profile *store.ProviderProfile) (*ai.Mode
 	var providerID string
 	var apiShape ai.Api
 	var defaultBaseURL string
+	var envBaseURLKey string
 
 	switch profile.Format {
 	case store.FormatAnthropicMessages:
 		providerID = "anthropic"
 		apiShape = "anthropic-messages"
 		defaultBaseURL = "https://api.anthropic.com"
+		envBaseURLKey = "ANTHROPIC_BASE_URL"
 	case store.FormatOpenAIResponses:
 		providerID = "openai"
 		apiShape = "openai-responses"
 		defaultBaseURL = "https://api.openai.com/v1"
+		envBaseURLKey = "OPENAI_BASE_URL"
 	default:
 		providerID = "openai"
 		apiShape = ai.APIOpenAICompletions
 		defaultBaseURL = "https://api.openai.com/v1"
+		envBaseURLKey = "OPENAI_BASE_URL"
 	}
 
 	modelID := strings.TrimSpace(profile.ModelID)
@@ -121,7 +127,9 @@ func (m *Manager) buildModelAndRuntime(profile *store.ProviderProfile) (*ai.Mode
 	resolved.Api = apiShape
 	if base := strings.TrimSpace(profile.BaseURL); base != "" {
 		resolved.BaseURL = strings.TrimRight(base, "/")
-	} else if resolved.BaseURL == "" {
+	} else if envBase := strings.TrimSpace(os.Getenv(envBaseURLKey)); envBase != "" {
+		resolved.BaseURL = strings.TrimRight(envBase, "/")
+	} else {
 		resolved.BaseURL = defaultBaseURL
 	}
 
@@ -141,7 +149,10 @@ func (m *Manager) buildModelAndRuntime(profile *store.ProviderProfile) (*ai.Mode
 func (m *Manager) InitOrResetSession(profile *store.ProviderProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.initSessionLocked(profile, true)
+}
 
+func (m *Manager) initSessionLocked(profile *store.ProviderProfile, startNewRecorder bool) error {
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
@@ -157,7 +168,7 @@ func (m *Manager) InitOrResetSession(profile *store.ProviderProfile) error {
 
 	targetCwd := m.baseCwd
 	if t := m.router.Target(); !t.IsRemote && t.WorkDir != "" {
-		targetCwd = t.WorkDir
+		targetCwd = store.ExpandLocalPath(t.WorkDir)
 	}
 
 	opts := coding.SessionOptions{
@@ -175,9 +186,11 @@ func (m *Manager) InitOrResetSession(profile *store.ProviderProfile) error {
 		return fmt.Errorf("create session: %w", err)
 	}
 
-	if rec, err := coding.StartSession(m.baseCwd, model, string(thinking)); err == nil {
-		sess.Record(rec)
-		m.activePath = ""
+	if startNewRecorder {
+		if rec, err := coding.StartSession(m.baseCwd, model, string(thinking)); err == nil {
+			sess.Record(rec)
+			m.activePath = ""
+		}
 	}
 
 	if m.listener != nil {
@@ -193,10 +206,7 @@ func (m *Manager) ApplyProfile(profile *store.ProviderProfile) error {
 	defer m.mu.Unlock()
 
 	if m.sess == nil {
-		m.mu.Unlock()
-		err := m.InitOrResetSession(profile)
-		m.mu.Lock()
-		return err
+		return m.initSessionLocked(profile, true)
 	}
 
 	model, _ := m.buildModelAndRuntime(profile)
@@ -214,15 +224,11 @@ func (m *Manager) SwitchTarget(t store.WorkspaceTarget) {
 
 // ListSavedSessions lists JSONL sessions stored for baseCwd (newest first).
 func (m *Manager) ListSavedSessions() []coding.SessionInfo {
-	return coding.ListSessions(m.baseCwd, "")
+	return coding.ListSessions(m.baseCwd, strings.TrimSpace(os.Getenv("PIUI_SESSION_DIR")))
 }
 
 // ResumeSavedSession loads a historical JSONL session into the current session and continues recording to it.
 func (m *Manager) ResumeSavedSession(path string, profile *store.ProviderProfile) ([]agent.AgentMessage, error) {
-	if err := m.InitOrResetSession(profile); err != nil {
-		return nil, err
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -230,13 +236,17 @@ func (m *Manager) ResumeSavedSession(path string, profile *store.ProviderProfile
 	if err != nil {
 		return nil, fmt.Errorf("load session tree: %w", err)
 	}
-	proj := tree.BuildProjection()
-	m.sess.LoadBranch(proj)
-
 	rec, err := coding.ResumeSession(path)
 	if err != nil {
 		return nil, fmt.Errorf("resume session recorder: %w", err)
 	}
+
+	if err := m.initSessionLocked(profile, false); err != nil {
+		return nil, err
+	}
+
+	proj := tree.BuildProjection()
+	m.sess.LoadBranch(proj)
 	m.sess.Record(rec)
 	m.activePath = path
 	return proj.Messages, nil
@@ -266,7 +276,11 @@ func (m *Manager) Steer(prompt string) {
 	if sess == nil {
 		return
 	}
-	sess.Steer(ai.NewUserText(prompt, time.Now().UnixMilli()))
+	actualPrompt := prompt
+	if notice := m.router.ConsumeSwitchNotice(); notice != "" {
+		actualPrompt = notice + "\n\n" + prompt
+	}
+	sess.Steer(ai.NewUserText(actualPrompt, time.Now().UnixMilli()))
 }
 
 // Abort immediately cancels the in-flight agent run and any active tool execution.

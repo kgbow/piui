@@ -6,13 +6,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/sky-valley/pi/agent"
+	"github.com/sky-valley/pi/ai"
 
 	"piui/internal/store"
 )
 
 func TestDeskAppHeadlessRenderAndHotSwitch(t *testing.T) {
+	t.Setenv("PIUI_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("PIUI_SESSION_DIR", filepath.Join(t.TempDir(), "sessions"))
+
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dirA, "a.txt"), []byte("hello from dir A\n"), 0o644); err != nil {
@@ -78,11 +84,63 @@ func TestDeskAppHeadlessRenderAndHotSwitch(t *testing.T) {
 		t.Fatalf("expected content from dirB after hot-switch, got err=%v text=%q", err, ExtractResultText(resB))
 	}
 
-	_, err = tools[bashTool].Execute(context.Background(), "call-3", map[string]any{"command": "echo LIVE_STREAM_OK"}, nil)
+	_, err = tools[bashTool].Execute(context.Background(), "call-3", map[string]any{"command": "printf '\\033[32mLIVE_STREAM_OK\\033[0m\\n'"}, nil)
 	if err != nil {
 		t.Fatalf("bash execute: %v", err)
 	}
-	if !strings.Contains(app.termDrawer.AllText(), "LIVE_STREAM_OK") {
-		t.Fatalf("expected live bash output in TermDrawer, got: %q", app.termDrawer.AllText())
+	termOut := app.termDrawer.AllText()
+	if !strings.Contains(termOut, "LIVE_STREAM_OK") || strings.Contains(termOut, "\x1b[32m") {
+		t.Fatalf("expected clean live bash output without ANSI codes in TermDrawer, got: %q", termOut)
+	}
+}
+
+func TestTruncatePreviewUTF8SafeAndAssistantEventHandling(t *testing.T) {
+	chinese := "这是一段包含中文字符的测试文本"
+	truncated := truncatePreview(chinese, 5)
+	if !utf8.ValidString(truncated) {
+		t.Fatalf("truncatePreview produced invalid UTF-8: %q", truncated)
+	}
+	if !strings.HasPrefix(truncated, "这是一段包\n") {
+		t.Fatalf("unexpected truncated prefix: %q", truncated)
+	}
+
+	t.Setenv("PIUI_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	app, err := NewDeskApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pure tool-call assistant message should not leave an empty assistant bubble behind.
+	toolOnlyMsg := &ai.AssistantMessage{
+		Content: ai.ContentList{
+			ai.ToolCall{ID: "tc-1", Name: "bash", Arguments: map[string]any{"command": "ls"}},
+		},
+	}
+	_ = app.handleAgentEvent(context.Background(), agent.AgentEvent{
+		Type:    agent.EvMessageStart,
+		Message: &ai.AssistantMessage{},
+	})
+	_ = app.handleAgentEvent(context.Background(), agent.AgentEvent{
+		Type:    agent.EvMessageEnd,
+		Message: toolOnlyMsg,
+	})
+	if len(app.entries) != 0 {
+		t.Fatalf("expected empty assistant entry to be pruned, got %d entries", len(app.entries))
+	}
+
+	// Assistant error message without deltas should be captured on EvMessageEnd.
+	errMsg := &ai.AssistantMessage{
+		ErrorMessage: "401 Unauthorized",
+	}
+	_ = app.handleAgentEvent(context.Background(), agent.AgentEvent{
+		Type:    agent.EvMessageStart,
+		Message: errMsg,
+	})
+	_ = app.handleAgentEvent(context.Background(), agent.AgentEvent{
+		Type:    agent.EvMessageEnd,
+		Message: errMsg,
+	})
+	if len(app.entries) != 1 || app.entries[0].ErrorText != "401 Unauthorized" {
+		t.Fatalf("expected assistant ErrorMessage to be preserved, got %+v", app.entries)
 	}
 }

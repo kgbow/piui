@@ -1,10 +1,13 @@
 package ui
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
+
+var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)`)
 
 // TermLine represents a line in the live bash output drawer.
 type TermLine struct {
@@ -43,11 +46,18 @@ func (d *TermDrawer) AppendChunk(chunk string) {
 	chunk = strings.ReplaceAll(chunk, "\r", "\n")
 	combined := d.partial + chunk
 	parts := strings.Split(combined, "\n")
-	d.partial = parts[len(parts)-1]
+	d.partial = stripANSI(parts[len(parts)-1])
 
 	for _, line := range parts[:len(parts)-1] {
-		d.pushLine(line)
+		d.pushLine(stripANSI(line))
 	}
+}
+
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	return ansiEscapeRe.ReplaceAllString(s, "")
 }
 
 func (d *TermDrawer) pushLine(line string) {

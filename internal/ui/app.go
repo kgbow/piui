@@ -105,17 +105,37 @@ func (a *DeskApp) refreshSessionsList() {
 	}
 }
 
+func (a *DeskApp) finalizeCurrentAssistant(msg agent.AgentMessage) {
+	if a.currentAssistant == nil {
+		return
+	}
+	SyncAssistantEntryFromMessage(a.currentAssistant, msg)
+	a.currentAssistant.Done = true
+	if a.currentAssistant.IsEmpty() {
+		// Remove empty assistant placeholder (e.g. a pure tool-call turn with no text/thinking)
+		for i := len(a.entries) - 1; i >= 0; i-- {
+			if a.entries[i] == a.currentAssistant {
+				a.entries = append(a.entries[:i], a.entries[i+1:]...)
+				break
+			}
+		}
+	}
+	a.currentAssistant = nil
+}
+
 // handleAgentEvent processes streaming events from sky-valley/pi/coding.Session.
 func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error {
 	a.updateUI(func() {
 		switch ev.Type {
 		case agent.EvMessageStart:
 			if ev.Message != nil && ev.Message.MessageRole() == ai.RoleAssistant {
+				a.finalizeCurrentAssistant(nil)
 				entry := &ChatEntry{
 					ID:          a.allocID(),
 					Kind:        EntryAssistant,
 					TargetBadge: a.currentTargetBadge(),
 				}
+				SyncAssistantEntryFromMessage(entry, ev.Message)
 				a.currentAssistant = entry
 				a.entries = append(a.entries, entry)
 			}
@@ -141,12 +161,12 @@ func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error
 			}
 
 		case agent.EvMessageEnd:
-			if a.currentAssistant != nil {
-				a.currentAssistant.Done = true
-				a.currentAssistant = nil
+			if ev.Message == nil || ev.Message.MessageRole() == ai.RoleAssistant {
+				a.finalizeCurrentAssistant(ev.Message)
 			}
 
 		case agent.EvToolExecutionStart:
+			a.finalizeCurrentAssistant(nil)
 			sum, dOld, dNew := SummarizeToolArgs(ev.ToolName, ev.Args)
 			card := &ChatEntry{
 				ID:          a.allocID(),
@@ -227,10 +247,7 @@ func (a *DeskApp) submitPrompt(raw string) {
 		a.updateUI(func() {
 			a.isRunning = false
 			a.activeToolStatus = ""
-			if a.currentAssistant != nil {
-				a.currentAssistant.Done = true
-				a.currentAssistant = nil
-			}
+			a.finalizeCurrentAssistant(nil)
 			if err != nil {
 				a.lastError = err.Error()
 			} else if res != nil && res.ErrorMessage != "" {
@@ -264,6 +281,9 @@ func (a *DeskApp) View(c *ui.Context) {
 	// Settings Modal (API Endpoints & Workspaces)
 	a.settingsModal.Render(c, a.cfg, func() {
 		_ = a.mgr.ApplyProfile(a.cfg.ActiveProfile())
+		if target := a.cfg.ActiveTarget(); target != nil {
+			a.mgr.SwitchTarget(*target)
+		}
 	})
 }
 
@@ -364,6 +384,8 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context) {
 						if err != nil {
 							a.lastError = err.Error()
 						} else {
+							a.toolCards = map[string]*ChatEntry{}
+							a.currentAssistant = nil
 							a.entries = RebuildEntriesFromMessages(msgs, &a.nextEntryID)
 							a.activeSessID = sessInfo.ID
 							a.lastError = ""

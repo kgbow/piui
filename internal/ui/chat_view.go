@@ -32,16 +32,66 @@ type ChatEntry struct {
 	ErrorText   string
 
 	// Tool call fields
-	ToolCallID string
-	ToolName   string
+	ToolCallID  string
+	ToolName    string
 	ToolSummary string
-	DiffOld    string
-	DiffNew    string
-	ToolOutput string
+	DiffOld     string
+	DiffNew     string
+	ToolOutput  string
 	ToolRunning bool
-	ToolError  bool
-	DurationMs int64
-	CardOpen   bool
+	ToolError   bool
+	DurationMs  int64
+	CardOpen    bool
+}
+
+// IsEmpty returns true if an assistant entry has no text, thinking, or error content.
+func (e *ChatEntry) IsEmpty() bool {
+	return strings.TrimSpace(e.Text) == "" &&
+		strings.TrimSpace(e.Thinking) == "" &&
+		strings.TrimSpace(e.ErrorText) == ""
+}
+
+// SyncAssistantEntryFromMessage populates final text, thinking, and error message fields
+// from a completed ai.AssistantMessage if they were not already populated via streaming deltas.
+func SyncAssistantEntryFromMessage(entry *ChatEntry, msg agent.AgentMessage) {
+	if entry == nil || msg == nil {
+		return
+	}
+	var am *ai.AssistantMessage
+	switch m := msg.(type) {
+	case ai.AssistantMessage:
+		am = &m
+	case *ai.AssistantMessage:
+		am = m
+	}
+	if am == nil {
+		return
+	}
+
+	if am.ErrorMessage != "" && entry.ErrorText == "" {
+		entry.ErrorText = am.ErrorMessage
+	}
+	if entry.Text == "" || entry.Thinking == "" {
+		var textParts, thinkParts []string
+		for _, block := range am.Content {
+			switch b := block.(type) {
+			case ai.TextContent:
+				if strings.TrimSpace(b.Text) != "" {
+					textParts = append(textParts, b.Text)
+				}
+			case ai.ThinkingContent:
+				if strings.TrimSpace(b.Thinking) != "" {
+					thinkParts = append(thinkParts, b.Thinking)
+				}
+			}
+		}
+		if entry.Text == "" && len(textParts) > 0 {
+			entry.Text = strings.Join(textParts, "\n\n")
+		}
+		if entry.Thinking == "" && len(thinkParts) > 0 {
+			entry.Thinking = strings.Join(thinkParts, "\n")
+		}
+	}
 }
 
 // RenderChatEntry renders a single ChatEntry inside the central list.
@@ -309,10 +359,12 @@ func appendAssistantMsg(out []*ChatEntry, am *ai.AssistantMessage, toolMap map[s
 	return out
 }
 
-func truncatePreview(s string, maxChars int) string {
+// truncatePreview truncates s at a valid UTF-8 rune boundary up to maxRunes characters.
+func truncatePreview(s string, maxRunes int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= maxChars {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
 		return s
 	}
-	return s[:maxChars] + "\n... (已截断)"
+	return string(runes[:maxRunes]) + "\n... (已截断)"
 }
