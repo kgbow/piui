@@ -67,3 +67,31 @@ func TestApplyRemoteEditsPreservesCRLFAndChecksUniqueness(t *testing.T) {
 		t.Fatalf("expected duplicate match error, got %v", err)
 	}
 }
+
+func TestSSHMultiplexArgsAndRemoteSkillsParsing(t *testing.T) {
+	args := sshMultiplexArgs("prod-gateway", "bash", "-c", "uptime")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "ControlMaster=auto") || !strings.Contains(joined, "ControlPersist=10m") || !strings.Contains(joined, "ControlPath=/tmp/piui-ssh-%C") {
+		t.Fatalf("expected SSH multiplexing flags in %q", joined)
+	}
+
+	rawSkillOutput := `===PIUI_SKILL_FILE:.pi/skills/deploy/SKILL.md===
+---
+name: prod-deploy
+description: Rolling zero-downtime deployment on prod-gateway
+---
+# Deploy Skill
+===PIUI_SKILL_FILE:/root/.pi/agent/skills/nginx-diag/SKILL.md===
+# Nginx diagnostic skill without YAML frontmatter
+`
+	skills := parseRemoteSkillOutput("prod-gateway", rawSkillOutput)
+	if len(skills) != 2 {
+		t.Fatalf("expected 2 parsed remote skills, got %d (%+v)", len(skills), skills)
+	}
+	if skills[0].Name != "prod-deploy" || !strings.Contains(skills[0].Description, "Rolling zero-downtime") {
+		t.Fatalf("unexpected first skill: %+v", skills[0])
+	}
+	if skills[1].Name != "nginx-diag" {
+		t.Fatalf("expected fallback folder name 'nginx-diag', got %+v", skills[1])
+	}
+}

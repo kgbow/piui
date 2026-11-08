@@ -69,6 +69,8 @@ func (d *TermDrawer) pushLine(line string) {
 		kind = "cmd"
 	case strings.HasPrefix(trimmed, "───") || strings.HasPrefix(trimmed, "[exit code:"):
 		kind = "meta"
+	case strings.HasPrefix(trimmed, "[Safety Gate]"):
+		kind = "warn"
 	case strings.HasPrefix(trimmed, "[error:"):
 		kind = "err"
 	}
@@ -103,17 +105,10 @@ func (d *TermDrawer) AllText() string {
 	return sb.String()
 }
 
-// View renders the right-hand terminal output drawer.
-func (d *TermDrawer) View(c *ui.Context) {
+// View renders the right-hand terminal output drawer matching the Doop Antigravity specification.
+func (d *TermDrawer) View(c *ui.Context, p Palette) {
 	if !d.Open {
 		return
-	}
-	t := c.Theme()
-	bg := ui.RGB(16, 18, 22)
-	headerBg := ui.RGB(24, 26, 32)
-	if !t.Dark {
-		bg = ui.RGB(23, 25, 30)
-		headerBg = ui.RGB(32, 35, 42)
 	}
 
 	d.ListState.Key = func(i int) any {
@@ -130,18 +125,39 @@ func (d *TermDrawer) View(c *ui.Context) {
 		totalRows++
 	}
 
-	ui.Column(c).Width(d.Width).FillHeight().Background(bg).BorderWidth(0, 0, 0, 1).BorderColor(t.Border).Children(func() {
-		// Header bar
-		ui.Row(c).FillWidth().Padding(8, 12).Gap(8).AlignItems(ui.Center).Background(headerBg).BorderWidth(0, 0, 1, 0).BorderColor(ui.RGB(45, 48, 58)).Children(func() {
-			ui.Text(c, "🐚 实时命令输出流").Bold().FontSize(13).TextColor(ui.RGB(228, 228, 231))
+	termActionBtn := func(label string, onClick func()) {
+		b := ui.ButtonBase(c).Padding(3, 8).Radius(6).
+			Border(1, ui.RGBA(255, 255, 255, 0.10)).AlignItems(ui.Center)
+		bg := ui.RGBA(255, 255, 255, 0.06)
+		fg := ui.Hex("#A1A1AA")
+		if b.Hovered() || b.Pressed() {
+			bg = ui.RGBA(255, 255, 255, 0.12)
+			fg = ui.Hex("#FFFFFF")
+		}
+		b.Background(bg).Children(func() {
+			ui.Text(c, label).FontSize(11).TextColor(fg)
+		})
+		if b.Clicked() && onClick != nil {
+			onClick()
+		}
+	}
+
+	ui.Column(c).Width(d.Width).FillHeight().Background(p.BgTerm).
+		BorderWidth(0, 0, 0, 1).BorderColor(p.BorderSubtle).Children(func() {
+		// 44px Header bar
+		ui.Row(c).FillWidth().Height(44).Padding(0, 14).Gap(7).
+			AlignItems(ui.Center).Background(p.BgTermHeader).
+			BorderWidth(0, 0, 1, 0).BorderColor(ui.RGBA(255, 255, 255, 0.07)).Children(func() {
+			ui.Icon(c, IconTerminal).Size(14, 14).TextColor(ui.Hex("#4ADE80"))
+			ui.Text(c, "实时命令输出流").Bold().FontSize(12).TextColor(ui.Hex("#E4E4E7"))
 			ui.Spacer(c)
-			if ui.Button(c, "复制").Clicked() {
+			termActionBtn("复制", func() {
 				c.WriteClipboard(d.AllText())
 				c.Toast("已复制终端输出到剪贴板")
-			}
-			if ui.Button(c, "清空").Clicked() {
+			})
+			termActionBtn("清空", func() {
 				d.Clear()
-			}
+			})
 		})
 
 		// Scrollable log lines
@@ -153,14 +169,16 @@ func (d *TermDrawer) View(c *ui.Context) {
 				line = TermLine{ID: -1, Text: d.partial, Kind: "out"}
 			}
 
-			color := ui.RGB(212, 212, 216)
+			color := ui.Hex("#D4D4D8")
 			switch line.Kind {
 			case "cmd":
-				color = ui.RGB(74, 222, 128) // green prompt
+				color = ui.Hex("#4ADE80") // green prompt
 			case "meta":
-				color = ui.RGB(148, 163, 184) // muted slate
+				color = ui.Hex("#94A3B8") // muted slate
+			case "warn":
+				color = ui.Hex("#FBBF24") // amber safety gate notice
 			case "err":
-				color = ui.RGB(248, 113, 113) // soft red
+				color = ui.Hex("#F87171") // soft red
 			}
 
 			display := line.Text
@@ -169,12 +187,12 @@ func (d *TermDrawer) View(c *ui.Context) {
 			}
 			el := ui.Text(c, display).
 				Font("Menlo").
-				FontSize(12).
+				FontSize(11.5).
 				TextColor(color).
 				Selectable()
 			if line.Kind == "cmd" {
 				el.Bold()
 			}
-		}).Grow(1).Padding(10, 12).Gap(3)
+		}).Grow(1).Padding(12, 14).Gap(3)
 	})
 }

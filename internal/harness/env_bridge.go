@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +72,15 @@ func (r *EnvironmentRouter) Target() store.WorkspaceTarget {
 	return r.target
 }
 
+// ExecutionEnv returns a coding.ExecutionEnv (LocalEnv or multiplexed SSHEnv) for the active target.
+func (r *EnvironmentRouter) ExecutionEnv() coding.ExecutionEnv {
+	t := r.Target()
+	if t.IsRemote {
+		return NewSSHEnv(t.SSHHost, t.WorkDir)
+	}
+	return coding.NewLocalEnv(store.ExpandLocalPath(t.WorkDir))
+}
+
 // ConsumeSwitchNotice returns a context notice if the target was switched since the last prompt.
 func (r *EnvironmentRouter) ConsumeSwitchNotice() string {
 	r.mu.Lock()
@@ -94,19 +102,27 @@ func (r *EnvironmentRouter) emitTerm(s string) {
 	}
 }
 
-// BuildTools returns the 4 core tools (read, write, edit, bash) wired through this router.
+// BuildTools returns the core coding tools (read, write, edit, bash, ls, find, grep)
+// plus the private workspace_probe tool wired through this router.
 func (r *EnvironmentRouter) BuildTools(fallbackCwd string) []agent.AgentTool {
 	fallbackCwd = store.ExpandLocalPath(fallbackCwd)
 	baseRead, _ := coding.CreateTool("read", fallbackCwd)
 	baseWrite, _ := coding.CreateTool("write", fallbackCwd)
 	baseEdit, _ := coding.CreateTool("edit", fallbackCwd)
 	baseBash := coding.CreateBashTool(fallbackCwd, nil)
+	baseLs, _ := coding.CreateTool("ls", fallbackCwd)
+	baseFind, _ := coding.CreateTool("find", fallbackCwd)
+	baseGrep, _ := coding.CreateTool("grep", fallbackCwd)
 
 	return []agent.AgentTool{
 		r.wrapFileTool("read", baseRead),
 		r.wrapFileTool("write", baseWrite),
 		r.wrapFileTool("edit", baseEdit),
 		r.wrapBashTool(baseBash),
+		r.wrapFileTool("ls", baseLs),
+		r.wrapFileTool("find", baseFind),
+		r.wrapFileTool("grep", baseGrep),
+		CreateWorkspaceProbeTool(r),
 	}
 }
 
@@ -140,11 +156,14 @@ func (r *EnvironmentRouter) wrapBashTool(schemaTemplate agent.AgentTool) agent.A
 		}
 
 		cmdStr, _ := params["command"].(string)
-		ts := time.Now().Format("15:04:05")
 		if target.IsRemote {
-			r.emitTerm(fmt.Sprintf("\n[%s] 🌐 %s:%s $ %s\n", ts, target.SSHHost, target.WorkDir, cmdStr))
+			wd := target.WorkDir
+			if wd == "" {
+				wd = "~"
+			}
+			r.emitTerm(fmt.Sprintf("\n[ssh:%s:%s] $ %s\n", target.ShortName(), wd, cmdStr))
 		} else {
-			r.emitTerm(fmt.Sprintf("\n[%s] 💻 %s $ %s\n", ts, filepath.Base(localCwd), cmdStr))
+			r.emitTerm(fmt.Sprintf("\n[local:%s] $ %s\n", store.ShortenHomePath(localCwd), cmdStr))
 		}
 
 		var baseOps coding.BashOperations
@@ -156,6 +175,7 @@ func (r *EnvironmentRouter) wrapBashTool(schemaTemplate agent.AgentTool) agent.A
 
 		hookedOps := coding.BashOperations{
 			Exec: func(ctx context.Context, command, cwd string, options coding.BashExecOptions) (*int, error) {
+				startedAt := time.Now()
 				origOnData := options.OnData
 				options.OnData = func(data []byte) {
 					if origOnData != nil {
@@ -164,10 +184,14 @@ func (r *EnvironmentRouter) wrapBashTool(schemaTemplate agent.AgentTool) agent.A
 					r.emitTerm(string(data))
 				}
 				code, err := baseOps.Exec(ctx, command, cwd, options)
+				durMs := time.Since(startedAt).Milliseconds()
+				if durMs < 1 {
+					durMs = 1
+				}
 				if err != nil {
-					r.emitTerm(fmt.Sprintf("\n[error: %v]\n", err))
-				} else if code != nil && *code != 0 {
-					r.emitTerm(fmt.Sprintf("\n[exit code: %d]\n", *code))
+					r.emitTerm(fmt.Sprintf("\n[error: %v · %dms]\n", err, durMs))
+				} else if code != nil {
+					r.emitTerm(fmt.Sprintf("\n[exit code: %d · %dms]\n", *code, durMs))
 				}
 				return code, err
 			},
@@ -199,7 +223,8 @@ func (r *EnvironmentRouter) sshBashOperations(target store.WorkspaceTarget) codi
 				remoteScript = fmt.Sprintf("cd -- %s && %s", shellQuotePath(cwd), command)
 			}
 
-			cmd := exec.CommandContext(execCtx, "ssh", "-o", "BatchMode=yes", target.SSHHost, "bash", "-lc", remoteScript)
+			args := sshMultiplexArgs(target.SSHHost, "bash", "-lc", remoteScript)
+			cmd := exec.CommandContext(execCtx, "ssh", args...)
 			stream := &chunkWriter{onData: options.OnData}
 			cmd.Stdout = stream
 			cmd.Stderr = stream
@@ -227,10 +252,15 @@ func (r *EnvironmentRouter) sshBashOperations(target store.WorkspaceTarget) codi
 func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store.WorkspaceTarget, name string, params map[string]any) (agent.AgentToolResult, error) {
 	pathArg, _ := params["path"].(string)
 	pathArg = strings.TrimSpace(pathArg)
-	if pathArg == "" {
+	remotePath := target.WorkDir
+	if remotePath == "" {
+		remotePath = "~"
+	}
+	if pathArg != "" {
+		remotePath = resolveRemotePath(target.WorkDir, pathArg)
+	} else if name == "read" || name == "write" || name == "edit" {
 		return agent.AgentToolResult{}, fmt.Errorf("%s: missing path argument", name)
 	}
-	remotePath := resolveRemotePath(target.WorkDir, pathArg)
 
 	switch name {
 	case "read":
@@ -267,6 +297,85 @@ func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store
 		return agent.AgentToolResult{
 			Content: ai.ContentList{ai.TextContent{Text: fmt.Sprintf("Successfully replaced %d block(s) in %s.", count, pathArg)}},
 		}, nil
+
+	case "ls":
+		limit := 500
+		if l, ok := paramInt(params, "limit"); ok && l > 0 {
+			limit = l
+		}
+		script := fmt.Sprintf("ls -1Ap -- %s | head -n %d", shellQuotePath(remotePath), limit)
+		out, err := runRemoteReadOnlyScript(ctx, target.SSHHost, "", script)
+		if err != nil {
+			return agent.AgentToolResult{}, fmt.Errorf("remote ls %s failed: %w", remotePath, err)
+		}
+		trimmed := strings.TrimSpace(out)
+		if trimmed == "" {
+			trimmed = "(empty directory)"
+		}
+		tr := coding.TruncateHead(trimmed, 0, 0)
+		return agent.AgentToolResult{
+			Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
+			StructuredContent: tr.Content,
+		}, nil
+
+	case "find":
+		pattern, _ := params["pattern"].(string)
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return agent.AgentToolResult{}, fmt.Errorf("find: missing pattern argument")
+		}
+		limit := 1000
+		if l, ok := paramInt(params, "limit"); ok && l > 0 {
+			limit = l
+		}
+		script := fmt.Sprintf("find . -name %s -print 2>/dev/null | sed 's|^\\./||' | head -n %d", shellQuote(pattern), limit)
+		out, err := runRemoteReadOnlyScript(ctx, target.SSHHost, remotePath, script)
+		if err != nil {
+			return agent.AgentToolResult{}, fmt.Errorf("remote find in %s failed: %w", remotePath, err)
+		}
+		trimmed := strings.TrimSpace(out)
+		if trimmed == "" {
+			trimmed = "No files found matching pattern"
+		}
+		tr := coding.TruncateHead(trimmed, 0, 0)
+		return agent.AgentToolResult{
+			Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
+			StructuredContent: tr.Content,
+		}, nil
+
+	case "grep":
+		pattern, _ := params["pattern"].(string)
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return agent.AgentToolResult{}, fmt.Errorf("grep: missing pattern argument")
+		}
+		limit := 100
+		if l, ok := paramInt(params, "limit"); ok && l > 0 {
+			limit = l
+		}
+		flags := "-rn"
+		if ic, ok := params["ignoreCase"].(bool); ok && ic {
+			flags += "i"
+		}
+		if lit, ok := params["literal"].(bool); ok && lit {
+			flags += "F"
+		} else {
+			flags += "E"
+		}
+		script := fmt.Sprintf("(grep %s -- %s . 2>/dev/null || true) | sed 's|^\\./||' | head -n %d", flags, shellQuote(pattern), limit)
+		out, err := runRemoteReadOnlyScript(ctx, target.SSHHost, remotePath, script)
+		if err != nil {
+			return agent.AgentToolResult{}, fmt.Errorf("remote grep in %s failed: %w", remotePath, err)
+		}
+		trimmed := strings.TrimSpace(out)
+		if trimmed == "" {
+			trimmed = "No matches found"
+		}
+		tr := coding.TruncateHead(trimmed, 0, 0)
+		return agent.AgentToolResult{
+			Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
+			StructuredContent: tr.Content,
+		}, nil
 	}
 
 	return agent.AgentToolResult{}, fmt.Errorf("unsupported remote tool: %s", name)
@@ -274,7 +383,8 @@ func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store
 
 func sshReadFile(ctx context.Context, sshHost, remotePath string) ([]byte, error) {
 	script := "cat -- " + shellQuotePath(remotePath)
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", sshHost, "bash", "-c", script)
+	args := sshMultiplexArgs(sshHost, "bash", "-c", script)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -289,7 +399,8 @@ func sshReadFile(ctx context.Context, sshHost, remotePath string) ([]byte, error
 }
 
 func sshWriteFile(ctx context.Context, sshHost, script, content string) error {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", sshHost, "bash", "-c", script)
+	args := sshMultiplexArgs(sshHost, "bash", "-c", script)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = strings.NewReader(content)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
