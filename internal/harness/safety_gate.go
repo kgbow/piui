@@ -235,7 +235,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 			resolved = resolveRemotePath(target.WorkDir, rawPath)
 		} else {
 			resolved = store.ExpandLocalPath(rawPath)
-			if !filepath.IsAbs(resolved) && target.WorkDir != "" {
+			if !filepath.IsAbs(resolved) && !strings.HasPrefix(resolved, "/") && target.WorkDir != "" {
 				resolved = filepath.Join(store.ExpandLocalPath(target.WorkDir), resolved)
 			}
 			resolved = filepath.ToSlash(resolved)

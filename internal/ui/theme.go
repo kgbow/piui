@@ -15,6 +15,7 @@ type Palette struct {
 	BgActive     ui.Color
 	BgTerm       ui.Color
 	BgTermHeader ui.Color
+	TermText     ui.Color
 	CodeBg       ui.Color
 	ModalBg      ui.Color
 	InputBg      ui.Color
@@ -59,6 +60,7 @@ func DarkPalette() Palette {
 		BgActive:     ui.RGBA(255, 255, 255, 0.075),
 		BgTerm:       ui.Hex("#08090C"),
 		BgTermHeader: ui.Hex("#0C0D12"),
+		TermText:     ui.Hex("#D4D4D8"),
 		CodeBg:       ui.Hex("#090A0D"),
 		ModalBg:      ui.Hex("#111116"),
 		InputBg:      ui.Hex("#0B0B0E"),
@@ -102,8 +104,9 @@ func LightPalette() Palette {
 		BgElevated:   ui.Hex("#F1F2F6"),
 		BgHover:      ui.RGBA(15, 23, 42, 0.045),
 		BgActive:     ui.RGBA(15, 23, 42, 0.075),
-		BgTerm:       ui.Hex("#14161B"),
-		BgTermHeader: ui.Hex("#1B1E25"),
+		BgTerm:       ui.Hex("#F3F4F6"),
+		BgTermHeader: ui.Hex("#F8FAFC"),
+		TermText:     ui.Hex("#1F2937"),
 		CodeBg:       ui.Hex("#F3F4F6"),
 		ModalBg:      ui.Hex("#FFFFFF"),
 		InputBg:      ui.Hex("#F8FAFC"),
@@ -190,7 +193,76 @@ func IconBtn(c *ui.Context, p Palette, icon *ui.SVG, boxSize, iconSize float32, 
 	return b
 }
 
-// MetaActionBtn renders a quiet inline action link used in turn-meta rows ("复制", "分叉重问", "从此处分叉").
+// IconTipBtn renders a quiet square icon button with a hover tooltip and accessibility label.
+func IconTipBtn(c *ui.Context, p Palette, icon *ui.SVG, boxSize, iconSize float32, tooltip string, onClick func()) ui.Element {
+	b := IconBtn(c, p, icon, boxSize, iconSize, onClick)
+	if tooltip != "" {
+		b.Tooltip(tooltip).Label(tooltip)
+	}
+	return b
+}
+
+// DangerIconBtn renders a quiet square icon button that highlights with danger styling on hover.
+func DangerIconBtn(c *ui.Context, p Palette, icon *ui.SVG, boxSize, iconSize float32, tooltip string, onClick func()) ui.Element {
+	b := ui.ButtonBase(c).Size(boxSize, boxSize).Radius(6).
+		AlignItems(ui.Center).Justify(ui.Center)
+	fg := p.TextMuted
+	bg := ui.Transparent
+	if b.Hovered() || b.Pressed() {
+		fg = p.DangerColor
+		bg = p.DangerSoft
+	}
+	b.Background(bg).Children(func() {
+		ui.Icon(c, icon).Size(iconSize, iconSize).TextColor(fg)
+	})
+	if tooltip != "" {
+		b.Tooltip(tooltip).Label(tooltip)
+	}
+	if b.Clicked() && onClick != nil {
+		onClick()
+	}
+	return b
+}
+
+// ToolbarIconBtn renders a compact bordered toolbar icon button supporting active state and custom icon tint.
+func ToolbarIconBtn(c *ui.Context, p Palette, icon *ui.SVG, boxSize, iconSize float32, active bool, tint ui.Color, tooltip string, onClick func()) ui.Element {
+	b := ui.ButtonBase(c).Size(boxSize, boxSize).Radius(7).
+		AlignItems(ui.Center).Justify(ui.Center)
+	bg := ui.Transparent
+	borderCol := p.BorderSubtle
+	fg := p.TextSecondary
+	if tint.A > 0 {
+		fg = tint
+	}
+	if active {
+		bg = p.BgActive
+		borderCol = p.BorderStrong
+		if tint.A == 0 {
+			fg = p.TextPrimary
+		}
+	}
+	if b.Hovered() || b.Pressed() {
+		if !active {
+			bg = p.BgHover
+		}
+		borderCol = p.BorderStrong
+		if tint.A == 0 {
+			fg = p.TextPrimary
+		}
+	}
+	b.Background(bg).Border(1, borderCol).Children(func() {
+		ui.Icon(c, icon).Size(iconSize, iconSize).TextColor(fg)
+	})
+	if tooltip != "" {
+		b.Tooltip(tooltip).Label(tooltip)
+	}
+	if b.Clicked() && onClick != nil {
+		onClick()
+	}
+	return b
+}
+
+// MetaActionBtn renders a quiet inline action link.
 func MetaActionBtn(c *ui.Context, p Palette, label string, onClick func()) ui.Element {
 	b := ui.ButtonBase(c).Padding(1, 3).Radius(4)
 	fg := p.TextMuted

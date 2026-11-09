@@ -125,16 +125,16 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 				ui.Text(c, req.Assessment.Reason).FontSize(12.5).TextColor(p.TextSecondary)
 			})
 
-			// Dark Command / File Diff Preview Box (.cmd-preview-box)
+			// Command / File Diff Preview Box (.cmd-preview-box)
 			ui.Column(c).FillWidth().Gap(4).Children(func() {
 				ui.Text(c, "待执行内容详情:").FontSize(11.5).TextColor(p.TextSecondary)
 				ui.Scroll(c).MaxHeight(160).FillWidth().Children(func() {
 					ui.Column(c).FillWidth().Padding(10, 12).Radius(8).
-						Background(ui.Hex("#0F172A")).Border(1, ui.RGBA(255, 255, 255, 0.10)).Gap(4).Children(func() {
+						Background(p.CodeBg).Border(1, p.BorderSubtle).Gap(4).Children(func() {
 						ui.Text(c, "# Target: "+req.Target.DisplaySub()).
-							Font("Menlo").FontSize(11).TextColor(ui.Hex("#94A3B8"))
+							Font("Menlo").FontSize(11).TextColor(p.TextMuted)
 						ui.Text(c, req.Assessment.Preview).
-							Font("Menlo").FontSize(11.5).TextColor(ui.Hex("#F8FAFC")).Selectable()
+							Font("Menlo").FontSize(11.5).TextColor(p.TermText).Selectable()
 					})
 				})
 			})
@@ -151,13 +151,15 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).
 				Padding(10, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
 				// Deny Button
-				denyBtn := ui.ButtonBase(c).Padding(6, 13).Radius(7).Border(1, p.DangerColor).AlignItems(ui.Center)
+				denyBtn := ui.ButtonBase(c).Padding(6, 12).Radius(7).Border(1, p.DangerColor).Gap(5).
+					AlignItems(ui.Center).Tooltip("拒绝执行并将上方纠偏指示反馈给 Agent")
 				denyBg := p.DangerSoft
 				if denyBtn.Hovered() {
 					denyBg = p.DangerColor.Alpha(0.22)
 				}
 				denyBtn.Background(denyBg).Children(func() {
-					ui.Text(c, "拒绝并反馈给 Agent (Deny)").Bold().FontSize(12).TextColor(p.DangerColor)
+					ui.Icon(c, IconCross).Size(13, 13).TextColor(p.DangerColor)
+					ui.Text(c, "拒绝").Bold().FontSize(12).TextColor(p.DangerColor)
 				})
 				if denyBtn.Clicked() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{
@@ -171,23 +173,37 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 				ui.Spacer(c)
 
 				// Trust in Session Button
-				renderModalGhostBtn(c, p, "本会话信任同类操作", func() {
+				trustBtn := ui.ButtonBase(c).Padding(6, 12).Radius(7).Border(1, p.BorderStrong).Gap(5).
+					AlignItems(ui.Center).Tooltip("允许本次执行，并在本会话内自动放行同类签名操作")
+				trustBg := ui.Transparent
+				trustFg := p.TextSecondary
+				if trustBtn.Hovered() || trustBtn.Pressed() {
+					trustBg = p.BgHover
+					trustFg = p.TextPrimary
+				}
+				trustBtn.Background(trustBg).Children(func() {
+					ui.Icon(c, IconShieldCheck).Size(13.5, 13.5).TextColor(trustFg)
+					ui.Text(c, "本会话免审").FontSize(12).TextColor(trustFg)
+				})
+				if trustBtn.Clicked() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{
 						Approved:       true,
 						TrustSignature: true,
 					})
 					m.Pop()
 					c.Toast("已放行并在当前会话内信任同类操作")
-				})
+				}
 
 				// Allow Button
-				allowBtn := ui.ButtonBase(c).Padding(6, 14).Radius(7).AlignItems(ui.Center)
+				allowBtn := ui.ButtonBase(c).Padding(6, 14).Radius(7).Gap(5).
+					AlignItems(ui.Center).Tooltip("批准本次操作执行")
 				allowBg := ui.Hex("#10B981")
 				if allowBtn.Hovered() {
 					allowBg = ui.Hex("#34D399")
 				}
 				allowBtn.Background(allowBg).Children(func() {
-					ui.Text(c, "允许本次执行 (Allow)").Bold().FontSize(12).TextColor(ui.Hex("#052E16"))
+					ui.Icon(c, IconCheck).Size(13.5, 13.5).TextColor(ui.Hex("#052E16"))
+					ui.Text(c, "允许").Bold().FontSize(12).TextColor(ui.Hex("#052E16"))
 				})
 				if allowBtn.Clicked() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{

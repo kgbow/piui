@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -23,18 +24,19 @@ const (
 
 // ChatEntry represents one item in the central conversation timeline.
 type ChatEntry struct {
-	ID            int
-	Kind          EntryKind
-	Text          string
-	Thinking      string
-	ThinkOpen     bool
-	Steered       bool
-	TargetBadge   string
-	IsRemote      bool
-	Done          bool
-	ErrorText     string
-	EntryID       string // JSONL tree entry ID for branching/checkout
-	ParentEntryID string // JSONL parent entry ID right before this message
+	ID              int
+	Kind            EntryKind
+	Text            string
+	Thinking        string
+	ThinkOpen       bool
+	Steered         bool
+	TargetBadge     string
+	IsRemote        bool
+	Done            bool
+	ErrorText       string
+	ErrorDetailOpen bool
+	EntryID         string // JSONL tree entry ID for branching/checkout
+	ParentEntryID   string // JSONL parent entry ID right before this message
 
 	// Tool call fields
 	ToolCallID  string
@@ -110,18 +112,20 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 
 	switch entry.Kind {
 	case EntryUser:
-		ui.Column(c).FillWidth().AlignItems(ui.End).Gap(5).Children(func() {
+		ui.Column(c).FillWidth().MinWidth(0).AlignItems(ui.End).Gap(5).Children(func() {
 			// Clean prompt bubble (ONLY prompt text inside)
-			ui.Column(c).MaxWidth(580).Padding(10, 14).Radius(14).
+			ui.Column(c).MaxWidth(580).MinWidth(0).Padding(10, 14).Radius(14).
 				Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
-				ui.Text(c, entry.Text).FontSize(13.5).TextColor(p.TextPrimary).Selectable()
+				ui.Text(c, entry.Text).FontSize(13.5).TextColor(p.TextPrimary).MinWidth(0).Selectable()
 			})
 
 			// External bottom-right metadata bar (.turn-meta.right)
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(0, 4).Children(func() {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Padding(0, 2).Children(func() {
 				if entry.Steered {
-					ui.Row(c).Padding(1, 6).Radius(4).Background(p.WarnSoft).Children(func() {
-						ui.Text(c, "Steer 插队").Bold().FontSize(10.5).TextColor(p.WarnColor)
+					ui.Row(c).Padding(1, 5).Radius(4).Background(p.WarnSoft).Gap(3).AlignItems(ui.Center).
+						Tooltip("运行中插队注入的纠偏指令").Children(func() {
+						ui.Icon(c, IconBolt).Size(10, 10).TextColor(p.WarnColor)
+						ui.Text(c, "Steer").Bold().Font("Menlo").FontSize(10).TextColor(p.WarnColor)
 					})
 				}
 				if entry.TargetBadge != "" {
@@ -129,17 +133,17 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 					if isRemote {
 						tagCol = p.SSHColor
 					}
-					ui.Text(c, entry.TargetBadge).Bold().Font("Menlo").FontSize(11).TextColor(tagCol)
+					ui.Text(c, entry.TargetBadge).Bold().Font("Menlo").FontSize(10.5).TextColor(tagCol)
 				}
 				if entry.EntryID != "" {
-					ui.Text(c, "#"+shortEntryID(entry.EntryID)).Font("Menlo").FontSize(11).TextColor(p.TextMuted)
+					ui.Text(c, "#"+shortEntryID(entry.EntryID)).Font("Menlo").FontSize(10.5).TextColor(p.TextMuted)
 				}
-				MetaActionBtn(c, p, "复制", func() {
+				IconTipBtn(c, p, IconCopy, 22, 12.5, "复制指令", func() {
 					c.WriteClipboard(entry.Text)
 					c.Toast("已复制指令到剪贴板")
 				})
 				if canFork && onFork != nil && entry.EntryID != "" {
-					MetaActionBtn(c, p, "分叉重问", func() {
+					IconTipBtn(c, p, IconBranch, 22, 12.5, "回退至此处并重新编辑发送", func() {
 						onFork(entry)
 					})
 				}
@@ -147,10 +151,10 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 		})
 
 	case EntryAssistant:
-		ui.Column(c).FillWidth().MaxWidth(760).Gap(8).Children(func() {
+		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Gap(8).Children(func() {
 			// Collapsible Thinking Bar (.thinking-bar)
 			if entry.Thinking != "" {
-				tb := ui.ButtonBase(c).Padding(3, 6).Radius(6).Gap(6).AlignItems(ui.Center)
+				tb := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(3, 6).Radius(6).Gap(6).AlignItems(ui.Center)
 				bg := ui.Transparent
 				if tb.Hovered() || tb.Pressed() {
 					bg = p.BgHover
@@ -159,17 +163,18 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 				if entry.ThinkOpen {
 					chev = IconChevronDown
 				}
-				title := "思考过程 (Reasoning)"
+				title := "思考过程"
 				if !entry.Done && entry.Text == "" {
-					title = "正在深度思考..."
+					title = "正在思考..."
 				}
 				tb.Background(bg).Children(func() {
-					ui.Icon(c, chev).Size(12, 12).TextColor(p.TextMuted)
-					ui.Text(c, title).FontSize(12).TextColor(p.TextSecondary)
+					ui.Icon(c, chev).Size(12, 12).TextColor(p.TextMuted).Shrink(0)
+					ui.Text(c, title).FontSize(12).TextColor(p.TextSecondary).Shrink(0)
 					if !entry.ThinkOpen {
 						preview := singleLinePreview(entry.Thinking, 64)
 						if preview != "" {
-							ui.Text(c, "· "+preview).Font("Menlo").FontSize(11.5).TextColor(p.TextMuted)
+							ui.Text(c, "· "+preview).Font("Menlo").FontSize(11.5).TextColor(p.TextMuted).
+								Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
 						}
 					}
 				})
@@ -178,9 +183,10 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 				}
 
 				if entry.ThinkOpen {
-					ui.Column(c).FillWidth().Padding(8, 12).Radius(8).
+					ui.Column(c).FillWidth().MinWidth(0).Padding(8, 12).Radius(8).
 						Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-						ui.Text(c, entry.Thinking).Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).Selectable()
+						ui.Text(c, entry.Thinking).Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).
+							FillWidth().MinWidth(0).Selectable()
 					})
 				}
 			}
@@ -200,33 +206,60 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 			}
 
 			if entry.ErrorText != "" {
-				ui.Row(c).FillWidth().Padding(10, 12).Radius(8).
-					Background(p.DangerSoft).Border(1, p.DangerColor).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, IconShieldAlert).Size(15, 15).TextColor(p.DangerColor)
-					ui.Text(c, entry.ErrorText).FontSize(12.5).TextColor(p.DangerColor).Selectable()
+				parsedErr := ParseAPIError(entry.ErrorText)
+				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Radius(8).
+					Background(p.DangerSoft).Border(1, p.DangerColor).Gap(6).Children(func() {
+					ui.Row(c).FillWidth().MinWidth(0).Gap(6).AlignItems(ui.Center).Children(func() {
+						ui.Icon(c, IconShieldAlert).Size(15, 15).TextColor(p.DangerColor).Shrink(0)
+						ui.Text(c, parsedErr.Title).Bold().FontSize(12.5).TextColor(p.DangerColor).
+							Grow(1).MinWidth(0).Selectable()
+						IconTipBtn(c, p, IconCopy, 24, 13, "复制完整报错信息", func() {
+							c.WriteClipboard(entry.ErrorText)
+							c.Toast("已复制完整报错信息到剪贴板")
+						})
+						if parsedErr.PrettyRaw != "" {
+							detailTip := "查看原始响应详情"
+							if entry.ErrorDetailOpen {
+								detailTip = "收起原始响应详情"
+							}
+							ToolbarIconBtn(c, p, IconCode, 24, 13, entry.ErrorDetailOpen, ui.Transparent, detailTip, func() {
+								entry.ErrorDetailOpen = !entry.ErrorDetailOpen
+							})
+						}
+					})
+					if parsedErr.Detail != "" {
+						ui.Text(c, parsedErr.Detail).FontSize(12).TextColor(p.TextPrimary).
+							FillWidth().MinWidth(0).Selectable()
+					}
+					if entry.ErrorDetailOpen && parsedErr.PrettyRaw != "" {
+						ui.Column(c).FillWidth().MinWidth(0).Padding(8, 10).Radius(6).
+							Background(p.CodeBg).Border(1, p.BorderSubtle).Children(func() {
+							ui.Text(c, truncatePreview(parsedErr.PrettyRaw, 1600)).
+								Font("Menlo").FontSize(11).TextColor(p.TextSecondary).
+								FillWidth().MinWidth(0).Selectable()
+						})
+					}
 				})
 			}
 
-			// External bottom-left metadata bar (.turn-meta.left)
+			// External bottom-left icon action bar (.turn-meta.left)
 			if entry.Done && (entry.Text != "" || entry.EntryID != "") {
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(2, 0).Children(func() {
-					if entry.EntryID != "" {
-						ui.Text(c, "节点 #"+shortEntryID(entry.EntryID)).Font("Menlo").FontSize(11).TextColor(p.TextMuted)
-					}
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Padding(2, 0).Children(func() {
 					if entry.Text != "" {
-						if entry.EntryID != "" {
-							ui.Text(c, "·").FontSize(11).TextColor(p.TextMuted)
-						}
-						MetaActionBtn(c, p, "复制回复", func() {
+						IconTipBtn(c, p, IconCopy, 24, 13, "复制回复", func() {
 							c.WriteClipboard(entry.Text)
 							c.Toast("已复制助手回复到剪贴板")
 						})
 					}
 					if canFork && onFork != nil && entry.EntryID != "" {
-						ui.Text(c, "·").FontSize(11).TextColor(p.TextMuted)
-						MetaActionBtn(c, p, "从此处分叉 (Branch Here)", func() {
+						IconTipBtn(c, p, IconBranch, 24, 13, "从此处分叉会话", func() {
 							onFork(entry)
 						})
+					}
+					if entry.EntryID != "" {
+						ui.Text(c, "#"+shortEntryID(entry.EntryID)).
+							Font("Menlo").FontSize(10.5).TextColor(p.TextMuted).Padding(0, 4).
+							Tooltip("会话树节点 ID: " + entry.EntryID)
 					}
 				})
 			}
@@ -234,10 +267,10 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 
 	case EntryTool:
 		// Compact Collapsible Tool Card (.tool-card)
-		ui.Column(c).FillWidth().MaxWidth(760).Radius(9).
+		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Radius(9).
 			Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
 			// Tool Card Header
-			hb := ui.ButtonBase(c).FillWidth().Padding(7, 11).Gap(8).AlignItems(ui.Center)
+			hb := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(7, 11).Gap(8).AlignItems(ui.Center)
 			bg := ui.Transparent
 			if hb.Hovered() || hb.Pressed() {
 				bg = p.BgHover
@@ -246,22 +279,23 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 				if entry.ToolRunning {
 					ui.Spinner(c).Size(13, 13)
 				} else if entry.ToolError {
-					ui.Icon(c, IconCross).Size(13, 13).TextColor(p.DangerColor)
+					ui.Icon(c, IconCross).Size(13, 13).TextColor(p.DangerColor).Shrink(0)
 				} else {
-					ui.Icon(c, IconCheck).Size(13, 13).TextColor(p.LocalColor)
+					ui.Icon(c, IconCheck).Size(13, 13).TextColor(p.LocalColor).Shrink(0)
 				}
 
-				ui.Text(c, "["+entry.ToolName+"]").Bold().Font("Menlo").FontSize(12).TextColor(p.TextPrimary)
+				ui.Text(c, "["+entry.ToolName+"]").Bold().Font("Menlo").FontSize(12).TextColor(p.TextPrimary).Shrink(0)
 				if entry.ToolSummary != "" {
-					ui.Text(c, singleLinePreview(entry.ToolSummary, 62)).Font("Menlo").FontSize(12).TextColor(p.TextSecondary)
+					ui.Text(c, singleLinePreview(entry.ToolSummary, 62)).Font("Menlo").FontSize(12).TextColor(p.TextSecondary).
+						Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
+				} else {
+					ui.Spacer(c)
 				}
 				if entry.ToolRunning {
-					ui.Text(c, "· 执行中...").Font("Menlo").FontSize(11).TextColor(p.TextMuted)
+					ui.Text(c, "· 执行中...").Font("Menlo").FontSize(11).TextColor(p.TextMuted).Shrink(0)
 				} else if entry.DurationMs > 0 {
-					ui.Text(c, fmt.Sprintf("· %dms", entry.DurationMs)).Font("Menlo").FontSize(11).TextColor(p.TextMuted)
+					ui.Text(c, fmt.Sprintf("· %dms", entry.DurationMs)).Font("Menlo").FontSize(11).TextColor(p.TextMuted).Shrink(0)
 				}
-
-				ui.Spacer(c)
 
 				if entry.TargetBadge != "" {
 					pillBg := p.LocalSoft
@@ -270,7 +304,7 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 						pillBg = p.SSHSoft
 						pillFg = p.SSHColor
 					}
-					ui.Row(c).Padding(1, 7).Radius(4).Background(pillBg).Children(func() {
+					ui.Row(c).Padding(1, 7).Radius(4).Background(pillBg).Shrink(0).Children(func() {
 						ui.Text(c, entry.TargetBadge).Bold().Font("Menlo").FontSize(10.5).TextColor(pillFg)
 					})
 				}
@@ -279,7 +313,7 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 				if entry.CardOpen {
 					chev = IconChevronDown
 				}
-				ui.Icon(c, chev).Size(13, 13).TextColor(p.TextMuted)
+				ui.Icon(c, chev).Size(13, 13).TextColor(p.TextMuted).Shrink(0)
 			})
 			if hb.Clicked() {
 				entry.CardOpen = !entry.CardOpen
@@ -287,35 +321,165 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 
 			// Tool Card Body (.tool-body)
 			if entry.CardOpen {
-				ui.Column(c).FillWidth().Padding(10, 12).Gap(7).
+				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Gap(7).
 					BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
 					if entry.DiffOld != "" || entry.DiffNew != "" {
 						ui.Text(c, "Diff 预览:").FontSize(11).TextColor(p.TextMuted)
 						if entry.DiffOld != "" {
-							ui.Column(c).FillWidth().Padding(6, 10).Radius(6).Background(p.DiffDelBg).Children(func() {
+							ui.Column(c).FillWidth().MinWidth(0).Padding(6, 10).Radius(6).Background(p.DiffDelBg).Children(func() {
 								ui.Text(c, "- "+truncatePreview(entry.DiffOld, 600)).
-									Font("Menlo").FontSize(11.5).TextColor(p.DiffDelFg).Selectable()
+									Font("Menlo").FontSize(11.5).TextColor(p.DiffDelFg).FillWidth().MinWidth(0).Selectable()
 							})
 						}
 						if entry.DiffNew != "" {
-							ui.Column(c).FillWidth().Padding(6, 10).Radius(6).Background(p.DiffAddBg).Children(func() {
+							ui.Column(c).FillWidth().MinWidth(0).Padding(6, 10).Radius(6).Background(p.DiffAddBg).Children(func() {
 								ui.Text(c, "+ "+truncatePreview(entry.DiffNew, 600)).
-									Font("Menlo").FontSize(11.5).TextColor(p.DiffAddFg).Selectable()
+									Font("Menlo").FontSize(11.5).TextColor(p.DiffAddFg).FillWidth().MinWidth(0).Selectable()
 							})
 						}
 					}
 
 					if entry.ToolOutput != "" {
-						ui.Column(c).FillWidth().Padding(8, 10).Radius(6).
+						ui.Column(c).FillWidth().MinWidth(0).Padding(8, 10).Radius(6).
 							Background(p.CodeBg).Border(1, p.BorderSubtle).Children(func() {
 							ui.Text(c, truncatePreview(entry.ToolOutput, 1600)).
-								Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).Selectable()
+								Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).FillWidth().MinWidth(0).Selectable()
 						})
 					}
 				})
 			}
 		})
 	}
+}
+
+// ParsedAPIError holds a humanized breakdown of a raw LLM / gateway / Cloudflare error.
+type ParsedAPIError struct {
+	Title     string
+	Detail    string
+	PrettyRaw string
+}
+
+// FormatErrorHeadline returns a concise single-line summary suitable for top status alerts.
+func FormatErrorHeadline(raw string) string {
+	p := ParseAPIError(raw)
+	if p.Detail != "" {
+		return singleLinePreview(p.Title+" — "+p.Detail, 110)
+	}
+	return singleLinePreview(p.Title, 110)
+}
+
+// ParseAPIError extracts readable title and detail messages from raw HTTP/JSON/Cloudflare error strings.
+func ParseAPIError(raw string) ParsedAPIError {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ParsedAPIError{Title: "请求失败"}
+	}
+
+	braceIdx := strings.Index(trimmed, "{")
+	lastBrace := strings.LastIndex(trimmed, "}")
+	if braceIdx != -1 && lastBrace > braceIdx {
+		prefix := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(trimmed[:braceIdx]), ":"))
+		jsonPart := trimmed[braceIdx : lastBrace+1]
+
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(jsonPart), &obj); err == nil && len(obj) > 0 {
+			prettyBytes, _ := json.MarshalIndent(obj, "", "  ")
+			prettyStr := string(prettyBytes)
+
+			// Unwrap nested {"error": {...}} if present
+			targetMap := obj
+			if nested, ok := obj["error"].(map[string]any); ok && len(nested) > 0 {
+				targetMap = nested
+			}
+
+			msg := mapStr(targetMap, "message", "detail", "error_description")
+			if msg == "" && targetMap != nil {
+				msg = mapStr(obj, "message", "detail")
+			}
+			title := mapStr(targetMap, "title")
+			if title == "" {
+				title = mapStr(obj, "title")
+			}
+			code := mapStr(targetMap, "code", "error_name", "type")
+			if code == "" {
+				code = mapStr(obj, "code", "error_name")
+			}
+			zone := mapStr(obj, "zone")
+			rayID := mapStr(obj, "ray_id")
+
+			var headlineParts []string
+			if prefix != "" {
+				if len(prefix) == 3 && prefix[0] >= '1' && prefix[0] <= '5' {
+					prefix = "HTTP " + prefix
+				}
+				if title == "" || !strings.Contains(strings.ToLower(title), strings.ToLower(prefix)) {
+					headlineParts = append(headlineParts, prefix)
+				}
+			}
+			if title != "" {
+				headlineParts = append(headlineParts, title)
+			}
+			if zone != "" {
+				headlineParts = append(headlineParts, zone)
+			}
+			if code != "" && !strings.HasPrefix(code, "http") {
+				headlineParts = append(headlineParts, code)
+			}
+
+			headline := strings.Join(headlineParts, " · ")
+			if headline == "" {
+				headline = "接口请求返回错误"
+			}
+
+			detail := strings.TrimSpace(msg)
+			if rayID != "" && !strings.Contains(detail, rayID) {
+				if detail != "" {
+					detail += fmt.Sprintf(" (Ray ID: %s)", rayID)
+				} else {
+					detail = "Ray ID: " + rayID
+				}
+			}
+			if detail == headline {
+				detail = ""
+			}
+
+			return ParsedAPIError{
+				Title:     headline,
+				Detail:    detail,
+				PrettyRaw: prettyStr,
+			}
+		}
+	}
+
+	// Plain non-JSON error
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) > 1 {
+		return ParsedAPIError{
+			Title:  singleLinePreview(lines[0], 96),
+			Detail: strings.TrimSpace(strings.Join(lines[1:], "\n")),
+		}
+	}
+	if len([]rune(trimmed)) > 120 {
+		return ParsedAPIError{
+			Title:  singleLinePreview(trimmed, 88),
+			Detail: trimmed,
+		}
+	}
+	return ParsedAPIError{Title: trimmed}
+}
+
+func mapStr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch s := v.(type) {
+			case string:
+				if strings.TrimSpace(s) != "" {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func shortEntryID(id string) string {

@@ -87,7 +87,7 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 				ui.Icon(c, IconSettings).Size(15, 15).TextColor(p.TextSecondary)
 				ui.Text(c, "渠道模型、工作区与安全审批设置").Bold().FontSize(14.5).TextColor(p.TextPrimary)
 				ui.Spacer(c)
-				IconBtn(c, p, IconCross, 26, 14, func() {
+				IconTipBtn(c, p, IconCross, 26, 14, "关闭设置", func() {
 					s.Open = false
 					s.editing = false
 				})
@@ -95,9 +95,9 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 
 			// 3-Segment Tab Bar
 			tabTitles := []string{
-				"渠道与模型配置",
-				fmt.Sprintf("工作区与 SSH 目标 (%d)", len(s.draft.Targets)),
-				fmt.Sprintf("安全拦截与 Skills (%d)", len(skills)),
+				"渠道与模型",
+				fmt.Sprintf("工作区 (%d)", len(s.draft.Targets)),
+				fmt.Sprintf("安全与 Skills (%d)", len(skills)),
 			}
 			renderSegmentedBar(c, p, &s.ActiveTab, tabTitles)
 
@@ -120,7 +120,7 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 					s.Open = false
 					s.editing = false
 				})
-				renderModalPrimaryBtn(c, p, "保存并立即生效", func() {
+				renderModalPrimaryBtn(c, p, "保存", func() {
 					s.commitToConfig(cfg, onApply)
 					s.Open = false
 					s.editing = false
@@ -351,17 +351,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 
 		ui.Spacer(c)
 
-		addBtn := ui.ButtonBase(c).Padding(5, 10).Radius(7).Border(1, p.BorderStrong).
-			Gap(5).AlignItems(ui.Center)
-		addBg := ui.Transparent
-		if addBtn.Hovered() {
-			addBg = p.BgHover
-		}
-		addBtn.Background(addBg).Children(func() {
-			ui.Icon(c, IconPlus).Size(12, 12).TextColor(p.TextSecondary)
-			ui.Text(c, "新增渠道").FontSize(11.5).TextColor(p.TextSecondary)
-		})
-		if addBtn.Clicked() {
+		ToolbarIconBtn(c, p, IconPlus, 28, 14, false, ui.Transparent, "新增模型渠道", func() {
 			id := fmt.Sprintf("channel-%d", time.Now().Unix()%10000)
 			draft.Profiles = append(draft.Profiles, store.ProviderProfile{
 				ID:            id,
@@ -375,18 +365,10 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 			draft.ActiveProfileID = id
 			s.fetchStatus = ""
 			s.fetchError = ""
-		}
+		})
 
 		if len(draft.Profiles) > 1 {
-			delBtn := ui.ButtonBase(c).Padding(5, 8).Radius(7).AlignItems(ui.Center)
-			fg := p.TextMuted
-			if delBtn.Hovered() {
-				fg = p.DangerColor
-			}
-			delBtn.Children(func() {
-				ui.Text(c, "删除").FontSize(11.5).TextColor(fg)
-			})
-			if delBtn.Clicked() {
+			DangerIconBtn(c, p, IconTrash, 28, 13.5, "删除当前渠道", func() {
 				for i := range draft.Profiles {
 					if draft.Profiles[i].ID == draft.ActiveProfileID {
 						draft.Profiles = append(draft.Profiles[:i], draft.Profiles[i+1:]...)
@@ -396,7 +378,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 				_ = draft.ActiveProfile()
 				s.fetchStatus = ""
 				s.fetchError = ""
-			}
+			})
 		}
 	})
 
@@ -453,16 +435,18 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 		// API Key input
 		ui.Column(c).FillWidth().Gap(4).Children(func() {
 			ui.Text(c, "API Key (留空读取环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY)").FontSize(11.5).TextColor(p.TextSecondary)
-			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
 				in := ui.TextInput(c, &prof.APIKey).Grow(1).Font("Menlo").Placeholder("sk-...")
 				if !s.ShowAPIKey {
 					in.Password()
 				}
-				toggleLabel := "显示"
+				eyeIcon := IconEye
+				eyeTip := "显示 API Key"
 				if s.ShowAPIKey {
-					toggleLabel = "隐藏"
+					eyeIcon = IconEyeOff
+					eyeTip = "隐藏 API Key"
 				}
-				renderModalGhostBtn(c, p, toggleLabel, func() {
+				ToolbarIconBtn(c, p, eyeIcon, 30, 14, s.ShowAPIKey, ui.Transparent, eyeTip, func() {
 					s.ShowAPIKey = !s.ShowAPIKey
 				})
 			})
@@ -471,13 +455,13 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 		// Models Management Box (.models-box)
 		ui.Column(c).FillWidth().Padding(10, 12).Radius(9).
 			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(8).Children(func() {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-				ui.Text(c, fmt.Sprintf("该渠道启用的模型 (%d/%d 已勾选)", len(prof.AvailableModels()), len(candidates))).
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(5).Children(func() {
+				ui.Text(c, fmt.Sprintf("启用模型 (%d/%d)", len(prof.AvailableModels()), len(candidates))).
 					Bold().FontSize(11.5).TextColor(p.TextSecondary)
 				ui.Spacer(c)
 
 				if len(candidates) > 0 {
-					MetaActionBtn(c, p, "全选", func() {
+					IconTipBtn(c, p, IconCheckAll, 26, 13.5, "全选候选模型", func() {
 						q := strings.ToLower(strings.TrimSpace(s.modelSearch))
 						for _, cand := range candidates {
 							if q == "" || strings.Contains(strings.ToLower(cand), q) {
@@ -485,8 +469,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 							}
 						}
 					})
-					ui.Text(c, "·").FontSize(11).TextColor(p.TextMuted)
-					MetaActionBtn(c, p, "仅留当前", func() {
+					IconTipBtn(c, p, IconFilter, 26, 13.5, "仅保留当前选中的模型", func() {
 						cur := strings.TrimSpace(prof.ModelID)
 						if cur != "" {
 							prof.Models = []string{cur}
@@ -496,19 +479,19 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 					})
 				}
 
-				fb := ui.ButtonBase(c).Padding(4, 9).Radius(6).Border(1, p.BorderStrong).
-					Gap(5).AlignItems(ui.Center).Disabled(s.fetchingModels)
+				fb := ui.ButtonBase(c).Size(26, 26).Radius(6).Border(1, p.BorderStrong).
+					AlignItems(ui.Center).Justify(ui.Center).Disabled(s.fetchingModels).
+					Tooltip("从 /v1/models 拉取模型列表").Label("从 /v1/models 拉取模型列表")
 				fBg := p.BgElevated
 				if fb.Hovered() && !s.fetchingModels {
 					fBg = p.BgHover
 				}
-				lbl := "手动拉取模型"
-				if s.fetchingModels {
-					lbl = "拉取中..."
-				}
 				fb.Background(fBg).Children(func() {
-					ui.Icon(c, IconRefresh).Size(12, 12).TextColor(p.Accent)
-					ui.Text(c, lbl).Bold().FontSize(11).TextColor(p.TextPrimary)
+					if s.fetchingModels {
+						ui.Spinner(c).Size(12, 12)
+					} else {
+						ui.Icon(c, IconRefresh).Size(13, 13).TextColor(p.Accent)
+					}
 				})
 				if fb.Clicked() {
 					s.triggerFetchModels(*prof, updateUI)
@@ -519,7 +502,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
 				ui.TextInput(c, &prof.ModelID).Grow(1).Font("Menlo").Placeholder("当前模型 ID (如 gpt-4.1 / deepseek-v3)")
 				if trimmed := strings.TrimSpace(prof.ModelID); trimmed != "" && !prof.HasModel(trimmed) {
-					renderModalGhostBtn(c, p, "+ 加入列表", func() {
+					ToolbarIconBtn(c, p, IconPlus, 28, 14, false, p.LocalColor, "加入候选模型列表", func() {
 						prof.AddModel(trimmed)
 					})
 				}
@@ -567,7 +550,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 									ui.Row(c).Size(14, 14).Radius(4).Background(boxBg).Border(1, boxBorder).
 										AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 										if checked {
-											ui.Icon(c, IconCheck).Size(10, 10).TextColor(ui.Hex("#09090B"))
+											ui.Icon(c, IconCheck).Size(10, 10).TextColor(p.BtnPrimaryFg)
 										}
 									})
 									el := ui.Text(c, modelName).Font("Menlo").FontSize(12).TextColor(p.TextPrimary)
@@ -586,24 +569,16 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 								ui.Spacer(c)
 
 								if isCurrent {
-									ui.Row(c).Padding(1, 7).Radius(4).Background(p.AccentSoft).Children(func() {
-										ui.Text(c, "当前使用").Bold().FontSize(10.5).TextColor(p.Accent)
+									ui.Row(c).Size(22, 22).Radius(6).Background(p.AccentSoft).
+										AlignItems(ui.Center).Justify(ui.Center).
+										Tooltip("当前默认使用模型").Children(func() {
+										ui.Icon(c, IconBolt).Size(12, 12).TextColor(p.Accent)
 									})
 								} else {
-									sb := ui.ButtonBase(c).Padding(2, 7).Radius(4).Border(1, p.BorderStrong)
-									sBg := ui.Transparent
-									sFg := p.TextSecondary
-									if sb.Hovered() {
-										sBg = p.BgHover
-										sFg = p.TextPrimary
-									}
-									sb.Background(sBg).Children(func() {
-										ui.Text(c, "设为当前").FontSize(10.5).TextColor(sFg)
-									})
-									if sb.Clicked() {
+									IconTipBtn(c, p, IconBolt, 22, 12, "设为当前默认模型", func() {
 										prof.ModelID = modelName
 										prof.AddModel(modelName)
-									}
+									})
 								}
 							})
 						}
@@ -662,7 +637,7 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 						})
 						if len(draft.Targets) > 1 && i > 0 {
 							idx := i
-							MetaActionBtn(c, p, "删除", func() {
+							DangerIconBtn(c, p, IconTrash, 26, 13.5, "移除该工作区目标", func() {
 								removedID := draft.Targets[idx].ID
 								draft.Targets = append(draft.Targets[:idx], draft.Targets[idx+1:]...)
 								if draft.ActiveTargetID == removedID {
@@ -696,7 +671,17 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 					dirHint = "远端工作目录 (如 /srv/gateway 或 ~)"
 				}
 				ui.TextInput(c, &s.NewTargetWorkDir).Grow(1).Font("Menlo").Placeholder(dirHint)
-				renderModalPrimaryBtn(c, p, "+ 添加目标", func() {
+				addTargetBtn := ui.ButtonBase(c).Size(30, 30).Radius(7).
+					AlignItems(ui.Center).Justify(ui.Center).
+					Tooltip("添加工作区目标").Label("添加工作区目标")
+				addBg := p.BtnPrimaryBg
+				if addTargetBtn.Hovered() {
+					addBg = addBg.Alpha(0.9)
+				}
+				addTargetBtn.Background(addBg).Children(func() {
+					ui.Icon(c, IconPlus).Size(15, 15).TextColor(p.BtnPrimaryFg)
+				})
+				if addTargetBtn.Clicked() {
 					workDir := strings.TrimSpace(s.NewTargetWorkDir)
 					sshHost := strings.TrimSpace(s.NewTargetSSHHost)
 					name := strings.TrimSpace(s.NewTargetName)
@@ -732,7 +717,7 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 							onApply()
 						}
 					}
-				})
+				}
 			})
 		})
 	})
@@ -778,7 +763,7 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 					FontSize(12).TextColor(p.TextSecondary)
 				ui.Spacer(c)
 				if trustedCount > 0 {
-					renderModalGhostBtn(c, p, "清空本会话免审白名单", func() {
+					DangerIconBtn(c, p, IconTrash, 26, 13.5, "清空本会话免审白名单", func() {
 						mgr.SafetyGate().ClearTrusted()
 						c.Toast("已清空本会话免审白名单")
 					})
