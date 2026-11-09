@@ -105,7 +105,7 @@ func (d *TermDrawer) AllText() string {
 	return sb.String()
 }
 
-// View renders the right-hand terminal output drawer matching the Doop Antigravity specification.
+// View renders the right-hand terminal output drawer.
 func (d *TermDrawer) View(c *ui.Context, p Palette) {
 	if !d.Open {
 		return

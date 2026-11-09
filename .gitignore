@@ -20,3 +20,16 @@ go.work.sum
 .DS_Store
 .idea/
 .vscode/
+
+# Secrets, local configs & runtime data
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.secret
+config.json
+config.json.bak
+.piui/
+sessions/
+

@@ -373,4 +373,11 @@ func TestDualThemeAndDoopComponentsRender(t *testing.T) {
 	if env := app.mgr.Router().ExecutionEnv(); env == nil || env.Cwd() != "/srv/gateway" {
 		t.Fatalf("expected SSHEnv Cwd='/srv/gateway', got %+v", env)
 	}
+
+	// Verify unified cascading selector switch (Provider ▸ Model ▸ Thinking Level)
+	app.switchChannelModelThinking(nil, "openai-chat", "gpt-4.1-mini", "high")
+	activeProf := app.cfg.ActiveProfile()
+	if activeProf == nil || activeProf.ID != "openai-chat" || activeProf.ModelID != "gpt-4.1-mini" || activeProf.ThinkingLevel != "high" {
+		t.Fatalf("unexpected profile state after switchChannelModelThinking: %+v", activeProf)
+	}
 }

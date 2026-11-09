@@ -589,11 +589,11 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 			}
 		})
 
-		// Section 3: Bottom Footer (.sb-footer)
-		ui.Column(c).FillWidth().Padding(8, 10).Gap(5).
+			// Section 3: Sleek Single-Row Bottom Footer (.sb-footer)
+		ui.Row(c).FillWidth().Padding(8, 10).Gap(6).AlignItems(ui.Center).
 			BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
 			// Settings Button
-			setBtn := ui.ButtonBase(c).FillWidth().Height(31).Padding(0, 10).Radius(7).
+			setBtn := ui.ButtonBase(c).Grow(1).Height(31).Padding(0, 10).Radius(7).
 				Border(1, p.BorderSubtle).Gap(8).AlignItems(ui.Center)
 			setBg := ui.Transparent
 			setFg := p.TextSecondary
@@ -603,31 +603,28 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 			}
 			setBtn.Background(setBg).Children(func() {
 				ui.Icon(c, IconSettings).Size(14, 14).TextColor(setFg)
-				ui.Text(c, "模型、工作区与安全设置").FontSize(12).TextColor(setFg)
+				ui.Text(c, "设置与模型渠道").FontSize(12).TextColor(setFg)
 			})
 			if setBtn.Clicked() {
 				a.settingsModal.ActiveTab = 0
 				a.settingsModal.Open = true
 			}
 
-			// Theme Toggle Button (Dark Obsidian <-> Light Daylight)
-			thBtn := ui.ButtonBase(c).FillWidth().Height(31).Padding(0, 10).Radius(7).
-				Border(1, p.BorderSubtle).Gap(8).AlignItems(ui.Center)
+			// Compact Theme Toggle Icon Button (Dark Obsidian <-> Light Daylight)
+			themeIcon := IconSun
+			if p.IsLight {
+				themeIcon = IconMoon
+			}
+			thBtn := ui.ButtonBase(c).Size(31, 31).Radius(7).
+				Border(1, p.BorderSubtle).AlignItems(ui.Center).Justify(ui.Center)
 			thBg := ui.Transparent
 			thFg := p.TextSecondary
 			if thBtn.Hovered() {
 				thBg = p.BgHover
 				thFg = p.TextPrimary
 			}
-			themeIcon := IconSun
-			themeLabel := "切换浅色主题 (Daylight)"
-			if p.IsLight {
-				themeIcon = IconMoon
-				themeLabel = "切换深色主题 (Obsidian)"
-			}
 			thBtn.Background(thBg).Children(func() {
 				ui.Icon(c, themeIcon).Size(14, 14).TextColor(thFg)
-				ui.Text(c, themeLabel).FontSize(12).TextColor(thFg)
 			})
 			if thBtn.Clicked() {
 				a.toggleTheme(c)
@@ -693,24 +690,6 @@ func (a *DeskApp) renderSessionListPanel(c *ui.Context, p Palette) {
 			}
 		})
 	})
-
-	// Compact bottom Session Branch Tree preview box (.tree-preview-box) when on History tab
-	if a.treeSnap != nil && len(a.treeSnap.Nodes) > 0 {
-		ui.Column(c).FillWidth().Padding(8, 9).Radius(8).
-			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(5).Children(func() {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(5).
-				Padding(0, 0, 4, 0).BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
-				ui.Icon(c, IconBranch).Size(12, 12).TextColor(p.Accent)
-				ui.Text(c, fmt.Sprintf("分支树视图 (%d 分支 · %d 节点)", a.treeSnap.BranchCount, len(a.treeSnap.Nodes))).
-					Bold().FontSize(11).TextColor(p.TextSecondary)
-				ui.Spacer(c)
-				ui.Text(c, "点击节点回溯").FontSize(10).TextColor(p.TextMuted)
-			})
-			ui.Scroll(c).MaxHeight(135).FillWidth().Children(func() {
-				a.renderTreeNodesList(c, p, a.treeSnap.Nodes)
-			})
-		})
-	}
 }
 
 func (a *DeskApp) renderSessionTreePanel(c *ui.Context, p Palette) {
@@ -869,68 +848,95 @@ func (a *DeskApp) switchThinkingLevel(c *ui.Context, level string) {
 	}
 }
 
-func (a *DeskApp) renderChannelMenu(c *ui.Context, m *ui.Menu) {
-	for i := range a.cfg.Profiles {
-		p := a.cfg.Profiles[i]
-		label := fmt.Sprintf("%s (%s)", p.Name, p.ModelID)
-		if p.ModelID == "" {
-			label = p.Name
-		}
-		if m.Item(label).Radio(p.ID == a.cfg.ActiveProfileID).Chosen() {
-			a.switchChannel(c, p.ID)
-		}
+func (a *DeskApp) switchChannelModelThinking(c *ui.Context, profileID, modelID, thinkingLevel string) {
+	a.cfg.ActiveProfileID = profileID
+	prof := a.cfg.ActiveProfile()
+	if prof == nil {
+		return
 	}
-	m.Separator()
-	if m.Item("新增 / 管理渠道与拉取模型...").Chosen() {
-		a.settingsModal.ActiveTab = 0
-		a.settingsModal.Open = true
+	if strings.TrimSpace(modelID) != "" {
+		prof.ModelID = modelID
+		prof.AddModel(modelID)
+	}
+	if strings.TrimSpace(thinkingLevel) != "" {
+		prof.ThinkingLevel = thinkingLevel
+	}
+	_ = a.cfg.Save()
+	if a.mgr != nil {
+		_ = a.mgr.ApplyProfile(prof)
+	}
+	if c != nil {
+		c.Toast(fmt.Sprintf("已切换至 %s · %s (Think: %s)", prof.Name, prof.ModelID, capitalizeWord(prof.ThinkingLevel)))
 	}
 }
 
-func (a *DeskApp) renderModelMenu(c *ui.Context, m *ui.Menu) {
-	prof := a.cfg.ActiveProfile()
-	if prof != nil {
-		models := prof.AvailableModels()
-		for _, mdl := range models {
-			modelID := mdl
-			if m.Item(modelID).Radio(modelID == prof.ModelID).Chosen() {
-				a.switchModel(c, modelID)
-			}
+// renderCascadingModelMenu builds a single unified 3-level cascading menu:
+// 供应商渠道 (Provider) ▸ 模型 (Model) ▸ 思考深度 (Thinking Level).
+func (a *DeskApp) renderCascadingModelMenu(c *ui.Context, m *ui.Menu) {
+	activeProf := a.cfg.ActiveProfile()
+
+	for i := range a.cfg.Profiles {
+		p := a.cfg.Profiles[i]
+		isCurrentChannel := activeProf != nil && p.ID == activeProf.ID
+		channelTitle := p.Name
+		if isCurrentChannel {
+			channelTitle = "● " + p.Name
 		}
+
+		models := p.AvailableModels()
+		m.Submenu(channelTitle, func(mModel *ui.Menu) {
+			if len(models) == 0 {
+				if mModel.Item("拉取或添加该渠道模型...").Chosen() {
+					a.cfg.ActiveProfileID = p.ID
+					a.settingsModal.ActiveTab = 0
+					a.settingsModal.Open = true
+				}
+				return
+			}
+
+			for _, mdl := range models {
+				modelID := mdl
+				isCurrentModel := isCurrentChannel && activeProf.ModelID == modelID
+				modelTitle := modelID
+				if isCurrentModel {
+					modelTitle = "● " + modelID
+				}
+
+				pid := p.ID
+				curThink := p.ThinkingLevel
+				if curThink == "" {
+					curThink = "medium"
+				}
+
+				mModel.Submenu(modelTitle, func(mThink *ui.Menu) {
+					for idx, val := range thinkingValues {
+						lvl := val
+						lbl := fmt.Sprintf("Think: %s (%s)", thinkingLabels[idx], val)
+						checked := isCurrentModel && strings.EqualFold(activeProf.ThinkingLevel, lvl)
+						if mThink.Item(lbl).Radio(checked).Chosen() {
+							a.switchChannelModelThinking(c, pid, modelID, lvl)
+						}
+					}
+				})
+			}
+		})
 	}
 
-	// Also allow cross-channel model quick-switch if other channels have models configured
-	hasOtherChannels := false
-	for i := range a.cfg.Profiles {
-		p := &a.cfg.Profiles[i]
-		if prof != nil && p.ID == prof.ID {
-			continue
-		}
-		if len(p.AvailableModels()) > 0 {
-			hasOtherChannels = true
-			break
-		}
-	}
-	if hasOtherChannels {
+	if activeProf != nil {
 		m.Separator()
-		for i := range a.cfg.Profiles {
-			p := a.cfg.Profiles[i]
-			if prof != nil && p.ID == prof.ID {
-				continue
-			}
-			for _, mdl := range p.AvailableModels() {
-				pid := p.ID
-				modelID := mdl
-				itemLabel := fmt.Sprintf("[%s] %s", p.Name, modelID)
-				if m.Item(itemLabel).Chosen() {
-					a.switchChannelAndModel(c, pid, modelID)
+		m.Submenu("当前思考深度: "+capitalizeWord(activeProf.ThinkingLevel), func(mThink *ui.Menu) {
+			for idx, val := range thinkingValues {
+				lvl := val
+				lbl := fmt.Sprintf("%s (%s)", thinkingLabels[idx], val)
+				if mThink.Item(lbl).Radio(strings.EqualFold(activeProf.ThinkingLevel, lvl)).Chosen() {
+					a.switchThinkingLevel(c, lvl)
 				}
 			}
-		}
+		})
 	}
 
 	m.Separator()
-	if m.Item("手动拉取 / 配置渠道模型...").Chosen() {
+	if m.Item("管理渠道与拉取模型...").Chosen() {
 		a.settingsModal.ActiveTab = 0
 		a.settingsModal.Open = true
 	}
@@ -941,46 +947,29 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 	prof := a.cfg.ActiveProfile()
 
 	ui.Column(c).Grow(1).FillHeight().Background(p.BgCanvas).Children(func() {
-		// 44px Top Status Bar (.top-bar) — No duplicate Channel/Model selectors!
+		// 44px Top Status Bar (.top-bar) — Minimal & Clean
 		ui.Row(c).FillWidth().Height(44).Padding(0, 16).Gap(8).
 			AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
 			// Active Environment Status Badge (.status-badge)
 			envBg := p.LocalSoft
 			envFg := p.LocalColor
-			envText := "本地工作区: " + target.DisplaySub()
+			envText := "本地工作区 · " + target.DisplaySub()
 			if target.IsRemote {
 				envBg = p.SSHSoft
 				envFg = p.SSHColor
-				envText = "远程 SSH: " + target.DisplaySub()
+				envText = "远程 SSH · " + target.DisplaySub()
 			}
-			ui.Row(c).Padding(4, 9).Radius(6).Background(envBg).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Padding(4, 10).Radius(6).Background(envBg).Gap(6).AlignItems(ui.Center).Children(func() {
 				ui.Box(c).Size(6, 6).Radius(99).Background(envFg)
 				ui.Text(c, envText).Bold().Font("Menlo").FontSize(11.5).TextColor(envFg)
 			})
 
-			// Safety Policy Chip (.top-chip)
-			safetyLabel := "远程高危拦截"
-			switch a.cfg.SafetyPolicy {
-			case store.SafetyPolicyAlwaysHighRisk:
-				safetyLabel = "全局高危拦截"
-			case store.SafetyPolicyStrictRemote:
-				safetyLabel = "远程严格审批"
-			case store.SafetyPolicyOff:
-				safetyLabel = "拦截已关闭"
+			// Branch Count Chip (only shown when conversation has forked into multiple branches)
+			if a.treeSnap != nil && a.treeSnap.BranchCount > 1 {
+				a.renderTopChip(c, p, IconBranch, fmt.Sprintf("%d 分支", a.treeSnap.BranchCount), func() {
+					a.sidebarTab = 1
+				})
 			}
-			a.renderTopChip(c, p, IconShield, safetyLabel, func() {
-				a.settingsModal.ActiveTab = 2
-				a.settingsModal.Open = true
-			})
-
-			// Branch Count Chip (.top-chip)
-			branchCount := 1
-			if a.treeSnap != nil && a.treeSnap.BranchCount > 0 {
-				branchCount = a.treeSnap.BranchCount
-			}
-			a.renderTopChip(c, p, IconBranch, fmt.Sprintf("%d 分支", branchCount), func() {
-				a.sidebarTab = 1
-			})
 
 			// Context Token Estimate (when conversation has history)
 			if tokens := a.mgr.EstimateContextTokens(); tokens > 0 {
@@ -997,10 +986,25 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 
 			ui.Spacer(c)
 
+			// Safety Policy Chip (.top-chip)
+			safetyLabel := "远程高危拦截"
+			switch a.cfg.SafetyPolicy {
+			case store.SafetyPolicyAlwaysHighRisk:
+				safetyLabel = "全局高危拦截"
+			case store.SafetyPolicyStrictRemote:
+				safetyLabel = "远程严格审批"
+			case store.SafetyPolicyOff:
+				safetyLabel = "拦截已关闭"
+			}
+			a.renderTopChip(c, p, IconShield, safetyLabel, func() {
+				a.settingsModal.ActiveTab = 2
+				a.settingsModal.Open = true
+			})
+
 			// Right Terminal Drawer Toggle Chip
-			termToggleLabel := "隐藏终端栏"
+			termToggleLabel := "终端"
 			if !a.termDrawer.Open {
-				termToggleLabel = "显示终端栏"
+				termToggleLabel = "显示终端"
 			}
 			a.renderTopChip(c, p, IconTerminal, termToggleLabel, func() {
 				a.termDrawer.Open = !a.termDrawer.Open
@@ -1077,46 +1081,13 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 						return true
 					})
 
-				// Bottom Composer Pill Bar (.composer-bar)
-				ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
+				// Bottom Composer Pill Bar (.composer-bar) — Single Unified Cascading Selector + Send/Steer
+				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
 					if prof != nil {
-						// 1. Channel Popover Pill
-						a.renderComposerPopoverPill(c, p, true, prof.Name, func(m *ui.Menu) {
-							a.renderChannelMenu(c, m)
-						})
-
-						// 2. Model Popover Pill
-						modelDisplay := prof.ModelID
-						if modelDisplay == "" {
-							modelDisplay = "选择模型"
-						}
-						a.renderComposerPopoverPill(c, p, false, modelDisplay, func(m *ui.Menu) {
-							a.renderModelMenu(c, m)
-						})
-
-						// 3. Thinking Level Popover Pill
-						thinkLabel := "Think: " + capitalizeWord(prof.ThinkingLevel)
-						a.renderComposerPopoverPill(c, p, false, thinkLabel, func(m *ui.Menu) {
-							for idx, val := range thinkingValues {
-								lvl := val
-								lbl := thinkingLabels[idx] + " (" + val + ")"
-								if m.Item(lbl).Radio(prof.ThinkingLevel == lvl).Chosen() {
-									a.switchThinkingLevel(c, lvl)
-								}
-							}
-						})
-
-						// 4. Wire Format Monospace Tag (.format-tag)
-						ui.Text(c, string(prof.Format)).Font("Menlo").FontSize(10.5).TextColor(p.TextMuted).Padding(0, 4)
+						a.renderUnifiedCascaderPill(c, p, prof)
 					}
 
 					ui.Spacer(c)
-
-					// Quick link to open Settings Tab 0 (Channels & Fetch Models)
-					MetaActionBtn(c, p, "渠道/拉取模型", func() {
-						a.settingsModal.ActiveTab = 0
-						a.settingsModal.Open = true
-					})
 
 					// Stop Button (when running)
 					if a.isRunning {
@@ -1191,21 +1162,32 @@ func (a *DeskApp) renderTopChip(c *ui.Context, p Palette, icon *ui.SVG, label st
 	}
 }
 
-func (a *DeskApp) renderComposerPopoverPill(c *ui.Context, p Palette, showOnlineDot bool, label string, buildMenu func(m *ui.Menu)) {
-	b := ui.ButtonBase(c).Padding(4, 9).Radius(7).Border(1, p.BorderSubtle).Gap(5).AlignItems(ui.Center)
+// renderUnifiedCascaderPill renders the single cascading selector pill for Provider ▸ Model ▸ Thinking Level.
+func (a *DeskApp) renderUnifiedCascaderPill(c *ui.Context, p Palette, prof *store.ProviderProfile) {
+	b := ui.ButtonBase(c).Padding(4, 10).Radius(99).Border(1, p.BorderSubtle).Gap(6).AlignItems(ui.Center)
 	bg := p.BgElevated
-	fg := p.TextSecondary
 	if b.Hovered() || b.Pressed() {
 		bg = p.BgHover
-		fg = p.TextPrimary
 	}
+
+	modelDisplay := strings.TrimSpace(prof.ModelID)
+	if modelDisplay == "" {
+		modelDisplay = "选择模型"
+	}
+	thinkDisplay := capitalizeWord(prof.ThinkingLevel)
+
 	b.Background(bg).Children(func() {
-		if showOnlineDot {
-			ui.Box(c).Size(6, 6).Radius(99).Background(p.LocalColor)
-		}
-		ui.Text(c, label).FontSize(11.5).TextColor(fg).SingleLine()
+		ui.Box(c).Size(6, 6).Radius(99).Background(p.LocalColor)
+		ui.Text(c, prof.Name).FontSize(11.5).TextColor(p.TextSecondary).SingleLine()
+		ui.Text(c, "/").FontSize(11).TextColor(p.TextMuted)
+		ui.Text(c, modelDisplay).Bold().Font("Menlo").FontSize(11.5).TextColor(p.TextPrimary).SingleLine()
+		ui.Row(c).Padding(1, 6).Radius(99).Background(p.AccentSoft).Children(func() {
+			ui.Text(c, thinkDisplay).Bold().Font("Menlo").FontSize(10).TextColor(p.Accent)
+		})
 		ui.Icon(c, IconChevronDown).Size(11, 11).TextColor(p.TextMuted)
-	}).PopoverMenuButton(buildMenu)
+	}).PopoverMenuButton(func(m *ui.Menu) {
+		a.renderCascadingModelMenu(c, m)
+	})
 }
 
 func capitalizeWord(s string) string {
