@@ -68,58 +68,58 @@ var (
 			level:    RiskCritical,
 			category: "根目录/主目录递归销毁",
 			reason:   "检测到针对根目录 (/) 或用户主目录 (~ / $HOME) 的强制删除指令",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|/\*|~|~/\*|\$HOME|\$HOME/\*)(\s|$|[;&|])`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|/\*|~|~/\*|\$HOME|\$HOME/\*)(\s|$|[;&|\n])`),
 		},
 		{
 			level:    RiskCritical,
 			category: "磁盘格式化与底层块写入",
 			reason:   "检测到 mkfs / dd / fdisk / parted 等底层磁盘破坏性指令",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(mkfs(?:\.\w+)?|fdisk|parted)\b|(?:^|[;&|]\s*)(?:sudo\s+)?dd\s+if=`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(mkfs(?:\.\w+)?|fdisk|parted)\b|(?:^|[;&|\n]\s*)(?:sudo\s+)?dd\s+if=`),
 		},
 		{
 			level:    RiskCritical,
 			category: "主机关机或重启",
 			reason:   "检测到 shutdown / reboot / poweroff / halt / init 0 系统关停指令",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(shutdown|reboot|poweroff|halt)\b|(?:^|[;&|]\s*)(?:sudo\s+)?init\s+[06]\b`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(shutdown|reboot|poweroff|halt)\b|(?:^|[;&|\n]\s*)(?:sudo\s+)?init\s+[06]\b`),
 		},
 	}
 
 	highRiskBashRules = []bashRiskRule{
 		{
 			level:    RiskHigh,
-			category: "递归或强制删除文件 (rm)",
-			reason:   "命令包含 rm -r / rm -f 强制或递归删除操作，可能导致数据不可逆丢失",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)\b`),
+			category: "递归或强制删除文件 (rm / find -delete)",
+			reason:   "命令包含 rm -r / rm -f / find -delete 强制或批量删除操作，可能导致数据不可逆丢失",
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)\b|find\b[^\n;&|]*\s-delete\b)`),
 		},
 		{
 			level:    RiskHigh,
 			category: "系统服务状态变更",
 			reason:   "命令将停止、重启或禁用 systemd / init 系统服务",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(systemctl\s+(stop|restart|reload|disable|mask|kill)\b|service\s+\S+\s+(stop|restart)\b)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(systemctl\s+(stop|restart|reload|disable|mask|kill)\b|service\s+\S+\s+(stop|restart)\b)`),
 		},
 		{
 			level:    RiskHigh,
 			category: "强制终止进程 (kill)",
 			reason:   "命令包含 kill -9 / killall / pkill 强制杀进程操作",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(kill\s+(-9|-KILL|-SIGKILL)\b|killall\b|pkill\b)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(kill\s+(-9|-KILL|-SIGKILL)\b|killall\b|pkill\b)`),
 		},
 		{
 			level:    RiskHigh,
 			category: "批量权限或属主修改",
 			reason:   "命令包含 chmod -R / chmod 777 / chown -R 权限变更",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(chmod\s+(-R\b|777\b)|chown\s+-R\b)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(chmod\s+(-R\b|777\b)|chown\s+-R\b)`),
 		},
 		{
 			level:    RiskHigh,
 			category: "容器或集群资源销毁",
 			reason:   "命令包含 docker rm/stop/prune 或 kubectl delete 容器/集群销毁动作",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(docker\s+(rm|rmi|stop|kill|system\s+prune)\b|docker-compose\s+down\b|kubectl\s+delete\b)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(docker\s+(rm|rmi|stop|kill|system\s+prune)\b|docker-compose\s+down\b|kubectl\s+delete\b)`),
 		},
 		{
 			level:    RiskHigh,
 			category: "防火墙与网络路由变更",
 			reason:   "命令将修改 iptables / ufw 防火墙或网络路由表，可能导致 SSH 断联",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(iptables\b|ufw\s+(disable|reset|delete|deny)\b|ip\s+route\s+(del|flush)\b|ifconfig\s+\S+\s+down\b)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(iptables\b|ufw\s+(disable|reset|delete|deny)\b|ip\s+route\s+(del|flush)\b|ifconfig\s+\S+\s+down\b)`),
 		},
 		{
 			level:    RiskHigh,
@@ -131,7 +131,7 @@ var (
 			level:    RiskHigh,
 			category: "Git 强制覆盖或工作区清理",
 			reason:   "命令包含 git push --force / git reset --hard / git clean -f，可能丢失未提交代码",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)git\s+(push\b[^\n;&|]*(--force|-f\b)|reset\s+--hard\b|clean\s+-[a-zA-Z]*f)`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)git\s+(push\b[^\n;&|]*(--force|-f\b)|reset\s+--hard\b|clean\s+-[a-zA-Z]*f)`),
 		},
 		{
 			level:    RiskHigh,
@@ -143,23 +143,50 @@ var (
 			level:    RiskHigh,
 			category: "系统软件包卸载",
 			reason:   "检测到 apt / yum / dnf / apk 软件包卸载指令",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)(?:sudo\s+)?(apt|apt-get|yum|dnf|apk)\s+(remove|purge|autoremove)\b`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(apt|apt-get|yum|dnf|apk)\s+(remove|purge|autoremove)\b`),
 		},
 		{
 			level:    RiskSensitive,
 			category: "sudo 提权执行",
 			reason:   "命令使用 sudo 提升至 root 权限执行",
-			re:       regexp.MustCompile(`(?:^|[;&|]\s*)sudo\s+\S+`),
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)sudo\s+\S+`),
 		},
 	}
 
-	readOnlyCmdPrefixes = []string{
-		"ls", "pwd", "cat", "head", "tail", "grep", "rg", "find", "fd",
-		"ps", "df", "du", "free", "uptime", "whoami", "id", "uname", "hostname",
-		"stat", "file", "wc", "which", "type", "env", "printenv", "date", "echo",
-		"git status", "git log", "git diff", "git show", "git branch", "git remote",
+	// pureReadOnlyBinaries lists standalone POSIX query utilities whose arguments cannot
+	// execute subcommands or write files when shell redirections/substitutions are absent.
+	pureReadOnlyBinaries = map[string]bool{
+		"ls": true, "pwd": true, "cat": true, "head": true, "tail": true,
+		"grep": true, "ps": true, "df": true, "du": true, "free": true,
+		"uptime": true, "whoami": true, "id": true, "uname": true,
+		"stat": true, "file": true, "wc": true, "which": true, "type": true,
+		"printenv": true, "echo": true,
+	}
+
+	safeHostnameFlags = map[string]bool{
+		"-f": true, "-s": true, "-i": true, "-I": true, "-A": true, "-d": true,
+		"--fqdn": true, "--long": true, "--short": true,
+		"--ip-address": true, "--all-ip-addresses": true, "--all-fqdns": true, "--domain": true,
+	}
+
+	safeGitBranchListFlags = map[string]bool{
+		"-a": true, "--all": true, "-r": true, "--remotes": true,
+		"-v": true, "-vv": true, "--verbose": true,
+		"-l": true, "--list": true, "--show-current": true,
 	}
 )
+
+func targetSignatureScope(target store.WorkspaceTarget) string {
+	if target.IsRemote {
+		wd := strings.TrimSpace(target.WorkDir)
+		if wd == "" {
+			wd = "~"
+		}
+		return fmt.Sprintf("ssh://%s:%s", strings.TrimSpace(target.SSHHost), wd)
+	}
+	wd := filepath.ToSlash(store.ExpandLocalPath(strings.TrimSpace(target.WorkDir)))
+	return "local://" + wd
+}
 
 // AssessToolCallRisk evaluates whether a tool invocation should be intercepted for user confirmation.
 func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy, toolName string, args map[string]any) *RiskAssessment {
@@ -172,6 +199,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 
 	checkHighRisk := target.IsRemote || policy == store.SafetyPolicyAlwaysHighRisk
 	strictRemote := target.IsRemote && policy == store.SafetyPolicyStrictRemote
+	scope := targetSignatureScope(target)
 
 	switch toolName {
 	case "bash":
@@ -180,6 +208,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 		if cmd == "" {
 			return nil
 		}
+		sig := scope + "|bash:" + cmd
 
 		// 1. Critical rules always trigger regardless of Local vs Remote.
 		for _, rule := range criticalBashRules {
@@ -190,7 +219,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 					Reason:        rule.reason,
 					TargetSummary: truncateOneLine(cmd, 90),
 					Preview:       cmd,
-					Signature:     "bash:" + cmd,
+					Signature:     sig,
 				}
 			}
 		}
@@ -205,7 +234,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 						Reason:        rule.reason,
 						TargetSummary: truncateOneLine(cmd, 90),
 						Preview:       cmd,
-						Signature:     "bash:" + cmd,
+						Signature:     sig,
 					}
 				}
 			}
@@ -216,10 +245,10 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 			return &RiskAssessment{
 				Level:         RiskSensitive,
 				Category:      "远程严格模式：命令执行确认",
-				Reason:        "当前处于「远程严格审批」模式，非只读查询类的远端命令均需人工确认",
+				Reason:        "当前处于「远程严格审批」模式，非明确只读查询类的远端命令均需人工确认",
 				TargetSummary: truncateOneLine(cmd, 90),
 				Preview:       cmd,
-				Signature:     "bash:" + cmd,
+				Signature:     sig,
 			}
 		}
 
@@ -241,6 +270,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 			resolved = filepath.ToSlash(resolved)
 		}
 
+		sig := scope + "|" + toolName + ":" + resolved
 		preview := buildFileMutationPreview(toolName, resolved, args)
 
 		if cat, reason, isCrit := matchSensitiveFilePath(resolved); cat != "" {
@@ -255,7 +285,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 					Reason:        reason,
 					TargetSummary: resolved,
 					Preview:       preview,
-					Signature:     toolName + ":" + resolved,
+					Signature:     sig,
 				}
 			}
 		}
@@ -267,7 +297,7 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 				Reason:        "当前处于「远程严格审批」模式，对远程服务器文件的任何写入或修改均需确认",
 				TargetSummary: resolved,
 				Preview:       preview,
-				Signature:     toolName + ":" + resolved,
+				Signature:     sig,
 			}
 		}
 	}
@@ -295,18 +325,199 @@ func matchSensitiveFilePath(p string) (category, reason string, critical bool) {
 	return "", "", false
 }
 
+// isReadOnlyBashCommand conservatively determines whether cmd is a single, provably
+// read-only inspection command. Any ambiguity, multiline/compound operator, redirection,
+// variable/command expansion, command runner (env/xargs), or mutating flag requires approval.
 func isReadOnlyBashCommand(cmd string) bool {
-	// Reject redirections, subshells, or compound operators in strict read-only check.
-	if strings.ContainsAny(cmd, "><`$") || strings.Contains(cmd, "&&") || strings.Contains(cmd, "||") || strings.Contains(cmd, ";") || strings.Contains(cmd, "|") {
+	if strings.ContainsAny(cmd, "\n\r\x00") {
 		return false
 	}
-	lower := strings.ToLower(strings.TrimSpace(cmd))
-	for _, prefix := range readOnlyCmdPrefixes {
-		if lower == prefix || strings.HasPrefix(lower, prefix+" ") {
+	tokens, ok := splitSafeShellWords(cmd)
+	if !ok || len(tokens) == 0 {
+		return false
+	}
+
+	bin := tokens[0]
+	if strings.Contains(bin, "/") {
+		return false
+	}
+	args := tokens[1:]
+
+	if pureReadOnlyBinaries[bin] {
+		return true
+	}
+
+	switch bin {
+	case "rg":
+		for _, a := range args {
+			if a == "--pre" || strings.HasPrefix(a, "--pre=") || a == "--pre-glob" || strings.HasPrefix(a, "--pre-glob=") {
+				return false
+			}
+		}
+		return true
+
+	case "find":
+		for _, a := range args {
+			low := strings.ToLower(a)
+			if low == "-delete" ||
+				low == "-exec" || low == "-execdir" ||
+				low == "-ok" || low == "-okdir" ||
+				strings.HasPrefix(low, "-fprint") || low == "-fls" {
+				return false
+			}
+		}
+		return true
+
+	case "fd":
+		for _, a := range args {
+			if a == "-x" || a == "-X" || a == "--exec" || a == "--exec-batch" || strings.HasPrefix(a, "--exec=") || strings.HasPrefix(a, "--exec-batch=") {
+				return false
+			}
+			// Reject short flag clusters containing x or X (e.g. -HIx).
+			if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsAny(a[1:], "xX") {
+				return false
+			}
+		}
+		return true
+
+	case "hostname":
+		for _, a := range args {
+			if !safeHostnameFlags[a] {
+				return false
+			}
+		}
+		return true
+
+	case "date":
+		for _, a := range args {
+			low := strings.ToLower(a)
+			if low == "-s" || strings.HasPrefix(low, "-s") || strings.HasPrefix(low, "--set") || low == "-f" || strings.HasPrefix(low, "--file") {
+				return false
+			}
+			// Any non-flag positional argument to `date` must be a `+FORMAT` specifier, never a clock-setting timestamp.
+			if !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
+				return false
+			}
+		}
+		return true
+
+	case "git":
+		i := 0
+		for i < len(args) {
+			switch args[i] {
+			case "--no-pager":
+				i++
+			case "-C":
+				if i+1 >= len(args) {
+					return false
+				}
+				i += 2
+			default:
+				if strings.HasPrefix(args[i], "-") {
+					return false
+				}
+				goto checkGitSub
+			}
+		}
+	checkGitSub:
+		if i >= len(args) {
+			return false
+		}
+		sub := args[i]
+		subArgs := args[i+1:]
+		for _, sa := range subArgs {
+			if sa == "--output" || strings.HasPrefix(sa, "--output=") {
+				return false
+			}
+		}
+		switch sub {
+		case "status", "log", "diff", "show", "rev-parse":
 			return true
+		case "branch":
+			for _, sa := range subArgs {
+				if !safeGitBranchListFlags[sa] {
+					return false
+				}
+			}
+			return true
+		case "remote":
+			if len(subArgs) == 0 {
+				return true
+			}
+			if len(subArgs) == 1 && (subArgs[0] == "-v" || subArgs[0] == "--verbose") {
+				return true
+			}
+			if len(subArgs) == 2 && subArgs[0] == "get-url" && !strings.HasPrefix(subArgs[1], "-") {
+				return true
+			}
+			return false
+		default:
+			return false
 		}
 	}
+
 	return false
+}
+
+// splitSafeShellWords splits a single-line command into literal argv tokens, returning
+// ok=false if any redirection, pipeline, compound operator, subshell, variable/backtick
+// expansion, backslash escape, or unclosed quote is present.
+func splitSafeShellWords(cmd string) ([]string, bool) {
+	var words []string
+	var cur strings.Builder
+	inToken := false
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(c)
+			}
+			continue
+		}
+		if inDouble {
+			switch c {
+			case '"':
+				inDouble = false
+			case '$', '`', '\\':
+				return nil, false
+			default:
+				cur.WriteByte(c)
+			}
+			continue
+		}
+
+		switch c {
+		case ' ', '\t':
+			if inToken {
+				words = append(words, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		case '\'':
+			inSingle = true
+			inToken = true
+		case '"':
+			inDouble = true
+			inToken = true
+		case ';', '&', '|', '<', '>', '(', ')', '{', '}', '`', '$', '\\':
+			return nil, false
+		default:
+			cur.WriteByte(c)
+			inToken = true
+		}
+	}
+	if inSingle || inDouble {
+		return nil, false
+	}
+	if inToken {
+		words = append(words, cur.String())
+	}
+	return words, true
 }
 
 func buildFileMutationPreview(toolName, resolvedPath string, args map[string]any) string {
@@ -416,17 +627,21 @@ func (g *SafetyGate) ClearTrusted() {
 }
 
 // BeforeToolCall is the sky-valley/pi agent.BeforeToolCallFunc hook.
+// It pins the active WorkspaceTarget for c.ToolCall.ID so that assessment, approval,
+// and execution always bind to the exact same host and working directory.
 // When a risky operation is detected, it suspends the calling goroutine on a channel
 // until the user approves/rejects in the UI or the context is cancelled.
 func (g *SafetyGate) BeforeToolCall(ctx context.Context, c agent.BeforeToolCallContext) *agent.BeforeToolCallResult {
 	g.mu.Lock()
 	policy := g.policy
 	promptFn := g.onPrompt
-	var target store.WorkspaceTarget
-	if g.router != nil {
-		target = g.router.Target()
-	}
+	router := g.router
 	g.mu.Unlock()
+
+	var target store.WorkspaceTarget
+	if router != nil {
+		target = router.PinToolTarget(c.ToolCall.ID)
+	}
 
 	assessment := AssessToolCallRisk(target, policy, c.ToolCall.Name, c.Args)
 	if assessment == nil {
@@ -480,6 +695,9 @@ func (g *SafetyGate) BeforeToolCall(ctx context.Context, c agent.BeforeToolCallC
 			return nil
 		}
 
+		if router != nil {
+			router.ReleaseToolTarget(c.ToolCall.ID)
+		}
 		reason := fmt.Sprintf("用户拒绝了高危操作 [%s: %s] (%s)。", req.ToolName, assessment.Category, assessment.TargetSummary)
 		if fb := strings.TrimSpace(dec.Feedback); fb != "" {
 			reason += " 用户反馈指示: " + fb
@@ -498,6 +716,9 @@ func (g *SafetyGate) BeforeToolCall(ctx context.Context, c agent.BeforeToolCallC
 		g.mu.Lock()
 		delete(g.pending, req.ID)
 		g.mu.Unlock()
+		if router != nil {
+			router.ReleaseToolTarget(c.ToolCall.ID)
+		}
 		return &agent.BeforeToolCallResult{
 			Block:     true,
 			Reason:    "操作审批在等待期间被取消 (Aborted)。",

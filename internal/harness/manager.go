@@ -25,11 +25,12 @@ type Manager struct {
 	safetyGate   *SafetyGate
 	sess         *coding.Session
 	rec          *coding.SessionRecorder
+	recorderErr  error
 	unsub        func()
 	listener     agent.Listener
-	credentials *coding.RuntimeCredentials
-	models      ai.MutableModels
-	activePath  string
+	credentials  *coding.RuntimeCredentials
+	models       ai.MutableModels
+	activePath   string
 	activeLeafID string
 }
 
@@ -104,6 +105,16 @@ func (m *Manager) ActiveSessionPath() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.activePath
+}
+
+// RecorderWarning returns a human-readable warning when session persistence failed to initialize or flush.
+func (m *Manager) RecorderWarning() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recorderErr != nil {
+		return m.recorderErr.Error()
+	}
+	return ""
 }
 
 // LastRecordedEntryID returns the latest JSONL entry ID written by the active SessionRecorder.
@@ -350,6 +361,12 @@ func (m *Manager) initSessionLocked(profile *store.ProviderProfile, existingRec 
 		_ = m.rec.Close()
 		m.rec = nil
 	}
+	if m.safetyGate != nil {
+		m.safetyGate.ClearTrusted()
+	}
+	if m.router != nil {
+		m.router.ClearPinnedTargets()
+	}
 
 	model, modelsRuntime := m.buildModelAndRuntime(profile)
 	m.models = modelsRuntime
@@ -385,10 +402,14 @@ func (m *Manager) initSessionLocked(profile *store.ProviderProfile, existingRec 
 		return fmt.Errorf("create session: %w", err)
 	}
 
+	m.recorderErr = nil
 	rec := existingRec
 	if rec == nil {
-		if started, err := coding.StartSession(m.baseCwd, model, string(thinking)); err == nil {
+		started, startErr := coding.StartSession(m.baseCwd, model, string(thinking))
+		if startErr == nil {
 			rec = started
+		} else {
+			m.recorderErr = fmt.Errorf("会话持久化记录器创建失败（当前对话仅保存在内存中，不会落盘）: %w", startErr)
 		}
 	}
 	if rec != nil {

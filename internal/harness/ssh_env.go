@@ -17,6 +17,9 @@ import (
 	"github.com/sky-valley/pi/coding"
 )
 
+// sshBinary is the OpenSSH client executable; package tests may override it with a local shim.
+var sshBinary = "ssh"
+
 // sshMultiplexArgs returns the OpenSSH flags for non-interactive ControlMaster connection
 // multiplexing. Using "%C" hashes (%l%h%p%r) so socket paths stay well within macOS/Linux
 // sun_path length limits while keeping connections warm across consecutive tool calls.
@@ -27,10 +30,45 @@ func sshMultiplexArgs(sshHost string, remoteCommand ...string) []string {
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPersist=10m",
 		"-o", "ControlPath=/tmp/piui-ssh-%C",
+		"--",
 		sshHost,
 	}
 	args = append(args, remoteCommand...)
 	return args
+}
+
+// sshRemoteBashCommand wraps a bash script as a single POSIX-quoted remote command string
+// so OpenSSH's remote login shell passes the entire script verbatim as argv[2] to bash,
+// preventing outer-shell word splitting, redirection interception, or premature $VAR expansion.
+func sshRemoteBashCommand(loginShell bool, script string) string {
+	if loginShell {
+		return "bash -lc " + shellQuote(script)
+	}
+	return "bash -c " + shellQuote(script)
+}
+
+// sshBashArgs builds OpenSSH ControlMaster arguments that invoke bash on the remote host
+// with the script safely quoted for the outer login shell.
+func sshBashArgs(sshHost string, loginShell bool, script string) []string {
+	return sshMultiplexArgs(sshHost, sshRemoteBashCommand(loginShell, script))
+}
+
+func isValidShellIdent(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit {
+			return false
+		}
+	}
+	return true
 }
 
 // SSHEnv implements coding.ExecutionEnv (coding.FileSystem + coding.Shell) over
@@ -155,12 +193,10 @@ func (e *SSHEnv) ReadTextLines(ctx context.Context, filePath string, maxLines in
 	return lines, nil
 }
 
-// WriteFile writes data to a file on the remote host, creating parent directories if needed.
+// WriteFile atomically writes data to a file on the remote host, creating parent directories if needed.
 func (e *SSHEnv) WriteFile(ctx context.Context, filePath string, data []byte) error {
 	remotePath := e.resolve(filePath)
-	dir := path.Dir(remotePath)
-	script := fmt.Sprintf("mkdir -p -- %s && cat > %s", shellQuotePath(dir), shellQuotePath(remotePath))
-	return sshWriteFile(ctx, e.SSHHost, script, string(data))
+	return sshWriteFileAtomic(ctx, e.SSHHost, remotePath, true, string(data))
 }
 
 // AppendFile appends data to a file on the remote host, creating parent directories if needed.
@@ -284,7 +320,7 @@ func (e *SSHEnv) Exec(ctx context.Context, command string, options *coding.Shell
 
 	var envExports strings.Builder
 	for k, v := range opts.Env {
-		if k != "" {
+		if isValidShellIdent(k) {
 			envExports.WriteString("export ")
 			envExports.WriteString(k)
 			envExports.WriteString("=")
@@ -295,11 +331,11 @@ func (e *SSHEnv) Exec(ctx context.Context, command string, options *coding.Shell
 
 	remoteScript := envExports.String() + command
 	if cwd != "" && cwd != "~" {
-		remoteScript = fmt.Sprintf("cd -- %s && { %s; }", shellQuotePath(cwd), remoteScript)
+		remoteScript = fmt.Sprintf("cd -- %s && {\n%s\n}", shellQuotePath(cwd), remoteScript)
 	}
 
-	args := sshMultiplexArgs(e.SSHHost, "bash", "-lc", remoteScript)
-	cmd := exec.CommandContext(execCtx, "ssh", args...)
+	args := sshBashArgs(e.SSHHost, true, remoteScript)
+	cmd := exec.CommandContext(execCtx, sshBinary, args...)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &chunkBufferWriter{
 		buf: &stdoutBuf,
@@ -464,8 +500,8 @@ func CheckMultiplexStatus(ctx context.Context, sshHost string) bool {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	args := []string{"-O", "check", "-o", "ControlPath=/tmp/piui-ssh-%C", sshHost}
-	cmd := exec.CommandContext(cctx, "ssh", args...)
+	args := []string{"-O", "check", "-o", "ControlPath=/tmp/piui-ssh-%C", "--", sshHost}
+	cmd := exec.CommandContext(cctx, sshBinary, args...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

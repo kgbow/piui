@@ -48,7 +48,7 @@ func CreateWorkspaceProbeTool(router *EnvironmentRouter) agent.AgentTool {
 			ai.Opt("subpath", ai.String("Optional subdirectory relative to the workspace root to inspect")),
 		),
 		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate agent.ToolUpdateFunc) (agent.AgentToolResult, error) {
-			target := router.Target()
+			target := router.ConsumeToolTarget(id)
 			subpath, _ := params["subpath"].(string)
 			subpath = strings.TrimSpace(subpath)
 
@@ -105,8 +105,8 @@ func runRemoteReadOnlyScript(ctx context.Context, sshHost, remoteDir, script str
 	if remoteDir != "" && remoteDir != "~" {
 		wrapped = fmt.Sprintf("cd -- %s && {\n%s\n}", shellQuotePath(remoteDir), script)
 	}
-	args := sshMultiplexArgs(sshHost, "bash", "-c", wrapped)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	args := sshBashArgs(sshHost, false, wrapped)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

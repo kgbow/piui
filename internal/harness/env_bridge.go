@@ -3,10 +3,13 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
-	"path"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,10 +28,11 @@ type TerminalStreamSink func(chunk string)
 // EnvironmentRouter routes tool calls (read, write, edit, bash) dynamically to the
 // currently active WorkspaceTarget without recreating or breaking the active Session.
 type EnvironmentRouter struct {
-	mu          sync.RWMutex
-	target      store.WorkspaceTarget
-	switched    bool
-	onTermChunk TerminalStreamSink
+	mu            sync.RWMutex
+	target        store.WorkspaceTarget
+	switched      bool
+	onTermChunk   TerminalStreamSink
+	pinnedTargets map[string]store.WorkspaceTarget
 }
 
 // NewEnvironmentRouter creates a router bound to an initial WorkspaceTarget.
@@ -37,8 +41,9 @@ func NewEnvironmentRouter(initial store.WorkspaceTarget, sink TerminalStreamSink
 		initial.WorkDir = store.ExpandLocalPath(initial.WorkDir)
 	}
 	return &EnvironmentRouter{
-		target:      initial,
-		onTermChunk: sink,
+		target:        initial,
+		onTermChunk:   sink,
+		pinnedTargets: map[string]store.WorkspaceTarget{},
 	}
 }
 
@@ -70,6 +75,65 @@ func (r *EnvironmentRouter) Target() store.WorkspaceTarget {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.target
+}
+
+// PinToolTarget snapshots and binds the current WorkspaceTarget to toolCallID so that
+// safety assessment, user approval, and actual tool execution are guaranteed to operate
+// on the exact same target even if the user hot-switches targets mid-flight.
+func (r *EnvironmentRouter) PinToolTarget(toolCallID string) store.WorkspaceTarget {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t := r.target
+	if toolCallID != "" {
+		if r.pinnedTargets == nil {
+			r.pinnedTargets = map[string]store.WorkspaceTarget{}
+		}
+		r.pinnedTargets[toolCallID] = t
+	}
+	return t
+}
+
+// PeekToolTarget returns the pinned target for toolCallID if present, or the active target otherwise.
+func (r *EnvironmentRouter) PeekToolTarget(toolCallID string) store.WorkspaceTarget {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if toolCallID != "" && r.pinnedTargets != nil {
+		if t, ok := r.pinnedTargets[toolCallID]; ok {
+			return t
+		}
+	}
+	return r.target
+}
+
+// ConsumeToolTarget pops and returns the pinned target for toolCallID, falling back to Target()
+// when invoked directly outside the BeforeToolCall pipeline.
+func (r *EnvironmentRouter) ConsumeToolTarget(toolCallID string) store.WorkspaceTarget {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if toolCallID != "" && r.pinnedTargets != nil {
+		if t, ok := r.pinnedTargets[toolCallID]; ok {
+			delete(r.pinnedTargets, toolCallID)
+			return t
+		}
+	}
+	return r.target
+}
+
+// ReleaseToolTarget removes a pinned target entry when a tool call is blocked or cancelled.
+func (r *EnvironmentRouter) ReleaseToolTarget(toolCallID string) {
+	if toolCallID == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.pinnedTargets, toolCallID)
+	r.mu.Unlock()
+}
+
+// ClearPinnedTargets clears all in-flight pinned tool targets (e.g. on session reset).
+func (r *EnvironmentRouter) ClearPinnedTargets() {
+	r.mu.Lock()
+	r.pinnedTargets = map[string]store.WorkspaceTarget{}
+	r.mu.Unlock()
 }
 
 // ExecutionEnv returns a coding.ExecutionEnv (LocalEnv or multiplexed SSHEnv) for the active target.
@@ -129,15 +193,17 @@ func (r *EnvironmentRouter) BuildTools(fallbackCwd string) []agent.AgentTool {
 func (r *EnvironmentRouter) wrapFileTool(name string, schemaTemplate agent.AgentTool) agent.AgentTool {
 	t := schemaTemplate
 	t.Execute = func(ctx context.Context, id string, params map[string]any, onUpdate agent.ToolUpdateFunc) (agent.AgentToolResult, error) {
-		target := r.Target()
+		target := r.ConsumeToolTarget(id)
+		if schemaTemplate.PrepareArguments != nil {
+			if prepared := schemaTemplate.PrepareArguments(params); prepared != nil {
+				params = prepared
+			}
+		}
 		if !target.IsRemote {
 			localCwd := store.ExpandLocalPath(target.WorkDir)
 			localTool, err := coding.CreateTool(name, localCwd)
 			if err != nil {
 				return agent.AgentToolResult{}, err
-			}
-			if localTool.PrepareArguments != nil {
-				params = localTool.PrepareArguments(params)
 			}
 			return localTool.Execute(ctx, id, params, onUpdate)
 		}
@@ -149,7 +215,7 @@ func (r *EnvironmentRouter) wrapFileTool(name string, schemaTemplate agent.Agent
 func (r *EnvironmentRouter) wrapBashTool(schemaTemplate agent.AgentTool) agent.AgentTool {
 	t := schemaTemplate
 	t.Execute = func(ctx context.Context, id string, params map[string]any, onUpdate agent.ToolUpdateFunc) (agent.AgentToolResult, error) {
-		target := r.Target()
+		target := r.ConsumeToolTarget(id)
 		localCwd := target.WorkDir
 		if !target.IsRemote {
 			localCwd = store.ExpandLocalPath(localCwd)
@@ -220,11 +286,11 @@ func (r *EnvironmentRouter) sshBashOperations(target store.WorkspaceTarget) codi
 
 			remoteScript := command
 			if cwd != "" && cwd != "~" {
-				remoteScript = fmt.Sprintf("cd -- %s && %s", shellQuotePath(cwd), command)
+				remoteScript = fmt.Sprintf("cd -- %s && {\n%s\n}", shellQuotePath(cwd), command)
 			}
 
-			args := sshMultiplexArgs(target.SSHHost, "bash", "-lc", remoteScript)
-			cmd := exec.CommandContext(execCtx, "ssh", args...)
+			args := sshBashArgs(target.SSHHost, true, remoteScript)
+			cmd := exec.CommandContext(execCtx, sshBinary, args...)
 			stream := &chunkWriter{onData: options.OnData}
 			cmd.Stdout = stream
 			cmd.Stderr = stream
@@ -264,17 +330,11 @@ func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store
 
 	switch name {
 	case "read":
-		rawBytes, err := sshReadFile(ctx, target.SSHHost, remotePath)
-		if err != nil {
-			return agent.AgentToolResult{}, fmt.Errorf("remote read %s failed: %w", remotePath, err)
-		}
-		return formatReadToolResult(string(rawBytes), pathArg, params)
+		return execRemoteRead(ctx, target.SSHHost, remotePath, pathArg, params)
 
 	case "write":
 		content, _ := params["content"].(string)
-		dir := path.Dir(remotePath)
-		script := fmt.Sprintf("mkdir -p -- %s && cat > %s", shellQuotePath(dir), shellQuotePath(remotePath))
-		if err := sshWriteFile(ctx, target.SSHHost, script, content); err != nil {
+		if err := sshWriteFileAtomic(ctx, target.SSHHost, remotePath, true, content); err != nil {
 			return agent.AgentToolResult{}, fmt.Errorf("remote write %s failed: %w", remotePath, err)
 		}
 		return agent.AgentToolResult{
@@ -290,8 +350,7 @@ func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store
 		if err != nil {
 			return agent.AgentToolResult{}, err
 		}
-		script := "cat > " + shellQuotePath(remotePath)
-		if err := sshWriteFile(ctx, target.SSHHost, script, updated); err != nil {
+		if err := sshWriteFileAtomic(ctx, target.SSHHost, remotePath, false, updated); err != nil {
 			return agent.AgentToolResult{}, fmt.Errorf("remote edit write %s failed: %w", remotePath, err)
 		}
 		return agent.AgentToolResult{
@@ -319,72 +378,313 @@ func (r *EnvironmentRouter) execRemoteFileTool(ctx context.Context, target store
 		}, nil
 
 	case "find":
-		pattern, _ := params["pattern"].(string)
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			return agent.AgentToolResult{}, fmt.Errorf("find: missing pattern argument")
-		}
-		limit := 1000
-		if l, ok := paramInt(params, "limit"); ok && l > 0 {
-			limit = l
-		}
-		script := fmt.Sprintf("find . -name %s -print 2>/dev/null | sed 's|^\\./||' | head -n %d", shellQuote(pattern), limit)
-		out, err := runRemoteReadOnlyScript(ctx, target.SSHHost, remotePath, script)
-		if err != nil {
-			return agent.AgentToolResult{}, fmt.Errorf("remote find in %s failed: %w", remotePath, err)
-		}
-		trimmed := strings.TrimSpace(out)
-		if trimmed == "" {
-			trimmed = "No files found matching pattern"
-		}
-		tr := coding.TruncateHead(trimmed, 0, 0)
-		return agent.AgentToolResult{
-			Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
-			StructuredContent: tr.Content,
-		}, nil
+		return execRemoteFind(ctx, target.SSHHost, remotePath, params)
 
 	case "grep":
-		pattern, _ := params["pattern"].(string)
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			return agent.AgentToolResult{}, fmt.Errorf("grep: missing pattern argument")
-		}
-		limit := 100
-		if l, ok := paramInt(params, "limit"); ok && l > 0 {
-			limit = l
-		}
-		flags := "-rn"
-		if ic, ok := params["ignoreCase"].(bool); ok && ic {
-			flags += "i"
-		}
-		if lit, ok := params["literal"].(bool); ok && lit {
-			flags += "F"
-		} else {
-			flags += "E"
-		}
-		script := fmt.Sprintf("(grep %s -- %s . 2>/dev/null || true) | sed 's|^\\./||' | head -n %d", flags, shellQuote(pattern), limit)
-		out, err := runRemoteReadOnlyScript(ctx, target.SSHHost, remotePath, script)
-		if err != nil {
-			return agent.AgentToolResult{}, fmt.Errorf("remote grep in %s failed: %w", remotePath, err)
-		}
-		trimmed := strings.TrimSpace(out)
-		if trimmed == "" {
-			trimmed = "No matches found"
-		}
-		tr := coding.TruncateHead(trimmed, 0, 0)
-		return agent.AgentToolResult{
-			Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
-			StructuredContent: tr.Content,
-		}, nil
+		return execRemoteGrep(ctx, target.SSHHost, remotePath, params)
 	}
 
 	return agent.AgentToolResult{}, fmt.Errorf("unsupported remote tool: %s", name)
 }
 
+func execRemoteRead(ctx context.Context, sshHost, remotePath, displayPath string, params map[string]any) (agent.AgentToolResult, error) {
+	script := fmt.Sprintf(
+		`p=%s
+if [ ! -e "$p" ]; then
+  echo "ENOENT: no such file or directory" >&2; exit 44
+fi
+if [ -d "$p" ]; then
+  echo "EISDIR: illegal operation on a directory, read" >&2; exit 45
+fi
+sz=$(wc -c < "$p" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$sz" ] && [ "$sz" -gt %d ] 2>/dev/null; then
+  echo "LARGE:$sz" >&2; exit 46
+fi
+cat -- "$p"`,
+		shellQuotePath(remotePath),
+		maxRemoteReadFullBytes,
+	)
+
+	args := sshBashArgs(sshHost, false, script)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			switch exitErr.ExitCode() {
+			case 44:
+				return agent.AgentToolResult{}, fmt.Errorf("remote read %s failed: ENOENT: no such file or directory", remotePath)
+			case 45:
+				return agent.AgentToolResult{}, fmt.Errorf("remote read %s failed: EISDIR: illegal operation on a directory, read", remotePath)
+			case 46:
+				return execRemoteReadLargeWindow(ctx, sshHost, remotePath, displayPath, params)
+			}
+		}
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return agent.AgentToolResult{}, fmt.Errorf("remote read %s failed: %v (%s)", remotePath, err, errMsg)
+		}
+		return agent.AgentToolResult{}, fmt.Errorf("remote read %s failed: %w", remotePath, err)
+	}
+
+	rawBytes := stdout.Bytes()
+	if mime := detectRemoteImageMimeType(rawBytes); mime != "" {
+		b64 := base64.StdEncoding.EncodeToString(rawBytes)
+		note := fmt.Sprintf("Read image file [%s]", mime)
+		return agent.AgentToolResult{
+			Content: ai.ContentList{
+				ai.TextContent{Text: note},
+				ai.ImageContent{Data: b64, MimeType: mime},
+			},
+			StructuredContent: note,
+		}, nil
+	}
+
+	return formatReadToolResult(string(rawBytes), displayPath, params)
+}
+
+func execRemoteReadLargeWindow(ctx context.Context, sshHost, remotePath, displayPath string, params map[string]any) (agent.AgentToolResult, error) {
+	offset, hasOffset := paramInt(params, "offset")
+	startLine := 1
+	if hasOffset && offset > 0 {
+		startLine = offset
+	}
+	maxLines := coding.DefaultMaxLines
+	hasUserLimit := false
+	if limit, ok := paramInt(params, "limit"); ok && limit > 0 {
+		hasUserLimit = true
+		if limit < maxLines {
+			maxLines = limit
+		}
+	}
+	// Fetch at most maxLines+1 and DefaultMaxBytes*2 so TruncateHead still produces standard notices without loading huge files.
+	byteWindow := coding.DefaultMaxBytes * 2
+	script := fmt.Sprintf(
+		`p=%s
+total=$(wc -l < "$p" 2>/dev/null | tr -d '[:space:]')
+echo "TOTAL_LINES:${total:-0}"
+tail -n +%d -- "$p" | head -n %d | head -c %d`,
+		shellQuotePath(remotePath),
+		startLine,
+		maxLines,
+		byteWindow,
+	)
+	out, err := runRemoteReadOnlyScript(ctx, sshHost, "", script)
+	if err != nil {
+		return agent.AgentToolResult{}, fmt.Errorf("remote windowed read %s failed: %w", remotePath, err)
+	}
+
+	nl := strings.IndexByte(out, '\n')
+	header := out
+	body := ""
+	if nl >= 0 {
+		header = out[:nl]
+		body = strings.TrimSuffix(out[nl+1:], "\n")
+	}
+	totalLines := 0
+	if strings.HasPrefix(header, "TOTAL_LINES:") {
+		totalLines, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(header, "TOTAL_LINES:")))
+	}
+	if totalLines > 0 && startLine > totalLines {
+		return agent.AgentToolResult{}, fmt.Errorf("Offset %d is beyond end of file (%d lines total)", startLine, totalLines)
+	}
+
+	tr := coding.TruncateHead(body, 0, 0)
+	shownLines := tr.OutputLines
+	if shownLines < 1 && body != "" {
+		shownLines = len(strings.Split(body, "\n"))
+	}
+	endLine := startLine + shownLines - 1
+	nextOffset := endLine + 1
+	text := tr.Content
+	if tr.Truncated || (totalLines > 0 && endLine < totalLines) || hasUserLimit {
+		if totalLines > 0 {
+			text += fmt.Sprintf("\n\n[Showing lines %d-%d of %d (large remote file streamed). Use offset=%d to continue.]", startLine, endLine, totalLines, nextOffset)
+		} else {
+			text += fmt.Sprintf("\n\n[Showing lines %d-%d (large remote file streamed). Use offset=%d to continue.]", startLine, endLine, nextOffset)
+		}
+	}
+	return agent.AgentToolResult{
+		Content:           ai.ContentList{ai.TextContent{Text: text}},
+		StructuredContent: text,
+	}, nil
+}
+
+func execRemoteFind(ctx context.Context, sshHost, remotePath string, params map[string]any) (agent.AgentToolResult, error) {
+	pattern, _ := params["pattern"].(string)
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return agent.AgentToolResult{}, fmt.Errorf("find: missing pattern argument")
+	}
+	limit := 1000
+	if l, ok := paramInt(params, "limit"); ok && l > 0 {
+		limit = l
+	}
+
+	// Prefer rg --files or git ls-files so .gitignore is respected; fallback to pruned POSIX find.
+	script := `if command -v rg >/dev/null 2>&1; then
+  rg --files --hidden -g '!.git' 2>/dev/null || true
+elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git ls-files --cached --others --exclude-standard 2>/dev/null || true
+else
+  find . \( -name .git -o -name node_modules -o -name vendor -o -name .venv \) -prune -o -not -type d -print 2>/dev/null | sed 's|^\./||'
+fi`
+
+	out, err := runRemoteReadOnlyScript(ctx, sshHost, remotePath, script)
+	if err != nil {
+		return agent.AgentToolResult{}, fmt.Errorf("remote find in %s failed: %w", remotePath, err)
+	}
+
+	matched, err := cleanRelativeFindPaths(out, pattern, limit)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	resultBody := "No files found matching pattern"
+	if len(matched) > 0 {
+		resultBody = strings.Join(matched, "\n")
+	}
+	tr := coding.TruncateHead(resultBody, 0, 0)
+	return agent.AgentToolResult{
+		Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
+		StructuredContent: tr.Content,
+	}, nil
+}
+
+func execRemoteGrep(ctx context.Context, sshHost, remotePath string, params map[string]any) (agent.AgentToolResult, error) {
+	pattern, _ := params["pattern"].(string)
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return agent.AgentToolResult{}, fmt.Errorf("grep: missing pattern argument")
+	}
+	globPat, _ := params["glob"].(string)
+	globPat = strings.TrimSpace(globPat)
+
+	limit := 100
+	if l, ok := paramInt(params, "limit"); ok {
+		limit = l
+	}
+	if limit < 1 {
+		limit = 1
+	}
+
+	ctxLines := 0
+	if c, ok := paramInt(params, "context"); ok && c > 0 {
+		ctxLines = c
+	}
+
+	ignoreCase, _ := params["ignoreCase"].(bool)
+	literal, _ := params["literal"].(bool)
+
+	// Validate regex locally first for consistent error feedback across Local and SSH.
+	if !literal {
+		expr := pattern
+		if ignoreCase {
+			expr = "(?i)" + expr
+		}
+		if _, err := regexp.Compile(expr); err != nil {
+			return agent.AgentToolResult{}, fmt.Errorf("invalid regex: %w", err)
+		}
+	}
+
+	var rgFlags, gitFlags, grepFlags []string
+	if ignoreCase {
+		rgFlags = append(rgFlags, "-i")
+		gitFlags = append(gitFlags, "-i")
+		grepFlags = append(grepFlags, "-i")
+	}
+	if literal {
+		rgFlags = append(rgFlags, "-F")
+		gitFlags = append(gitFlags, "-F")
+		grepFlags = append(grepFlags, "-F")
+	} else {
+		gitFlags = append(gitFlags, "-E")
+		grepFlags = append(grepFlags, "-E")
+	}
+	if ctxLines > 0 {
+		cFlag := fmt.Sprintf("-C %d", ctxLines)
+		rgFlags = append(rgFlags, cFlag)
+		gitFlags = append(gitFlags, cFlag)
+		grepFlags = append(grepFlags, cFlag)
+	}
+	if globPat != "" {
+		rgFlags = append(rgFlags, "-g "+shellQuote(globPat))
+	}
+
+	qPat := shellQuote(pattern)
+	qTarget := shellQuotePath(remotePath)
+	rgFlagStr := strings.Join(rgFlags, " ")
+	gitFlagStr := strings.Join(gitFlags, " ")
+	grepFlagStr := strings.Join(grepFlags, " ")
+
+	script := fmt.Sprintf(
+		`target=%s
+if [ ! -e "$target" ]; then
+  echo "ENOENT" >&2; exit 44
+fi
+if [ -f "$target" ]; then
+  if command -v rg >/dev/null 2>&1; then
+    rg -n --with-filename --no-heading --color=never %s -- %s "$target" 2>/dev/null || true
+  else
+    grep -nH %s -- %s "$target" 2>/dev/null || true
+  fi
+  exit 0
+fi
+cd -- "$target" || exit 1
+if command -v rg >/dev/null 2>&1; then
+  rg -n --with-filename --no-heading --color=never %s -- %s . 2>/dev/null || true
+elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git grep -n --no-color -I --untracked %s -- %s 2>/dev/null || true
+else
+  grep -rnHI --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor %s -- %s . 2>/dev/null || \
+    find . \( -name .git -o -name node_modules -o -name vendor \) -prune -o -type f -exec grep -nHI %s -- %s {} + 2>/dev/null || true
+fi`,
+		qTarget,
+		rgFlagStr, qPat,
+		grepFlagStr, qPat,
+		rgFlagStr, qPat,
+		gitFlagStr, qPat,
+		grepFlagStr, qPat,
+		grepFlagStr, qPat,
+	)
+
+	args := sshBashArgs(sshHost, false, script)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+			return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", remotePath)
+		}
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return agent.AgentToolResult{}, fmt.Errorf("remote grep in %s failed: %v (%s)", remotePath, err, errMsg)
+		}
+		return agent.AgentToolResult{}, fmt.Errorf("remote grep in %s failed: %w", remotePath, err)
+	}
+
+	formatted, err := filterAndFormatRemoteGrepOutput(stdout.String(), globPat, limit, ctxLines > 0)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	if strings.TrimSpace(formatted) == "" {
+		formatted = "No matches found"
+	}
+	tr := coding.TruncateHead(formatted, 0, 0)
+	return agent.AgentToolResult{
+		Content:           ai.ContentList{ai.TextContent{Text: tr.Content}},
+		StructuredContent: tr.Content,
+	}, nil
+}
+
 func sshReadFile(ctx context.Context, sshHost, remotePath string) ([]byte, error) {
 	script := "cat -- " + shellQuotePath(remotePath)
-	args := sshMultiplexArgs(sshHost, "bash", "-c", script)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	args := sshBashArgs(sshHost, false, script)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -398,9 +698,38 @@ func sshReadFile(ctx context.Context, sshHost, remotePath string) ([]byte, error
 	return stdout.Bytes(), nil
 }
 
+// sshWriteFileAtomic writes content to a temporary file in the target directory on the
+// remote host and atomically renames it into place only after stdin finishes cleanly,
+// preventing file truncation or partial writes on connection drops.
+func sshWriteFileAtomic(ctx context.Context, sshHost, remotePath string, createParent bool, content string) error {
+	mkdirStep := ""
+	if createParent {
+		mkdirStep = `mkdir -p -- "$dir" && `
+	}
+	script := fmt.Sprintf(
+		`target=%s
+if [ -L "$target" ]; then
+  resolved=$(realpath -- "$target" 2>/dev/null || readlink -f -- "$target" 2>/dev/null || true)
+  if [ -n "$resolved" ]; then target="$resolved"; fi
+fi
+dir=$(dirname -- "$target")
+%stmp=$(mktemp "$dir/.piui-tmp.XXXXXX") || exit 1
+trap 'rm -f -- "$tmp"' EXIT
+if [ -e "$target" ]; then
+  chmod --reference="$target" "$tmp" 2>/dev/null || cp -p -- "$target" "$tmp" 2>/dev/null || true
+else
+  chmod 0644 "$tmp" 2>/dev/null || true
+fi
+cat > "$tmp" && mv -f -- "$tmp" "$target" && trap - EXIT`,
+		shellQuotePath(remotePath),
+		mkdirStep,
+	)
+	return sshWriteFile(ctx, sshHost, script, content)
+}
+
 func sshWriteFile(ctx context.Context, sshHost, script, content string) error {
-	args := sshMultiplexArgs(sshHost, "bash", "-c", script)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	args := sshBashArgs(sshHost, false, script)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	cmd.Stdin = strings.NewReader(content)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -515,6 +844,15 @@ func paramInt(params map[string]any, key string) (int, bool) {
 	return 0, false
 }
 
+type remoteEditSpan struct {
+	blockIdx int
+	start    int
+	end      int
+	newText  string
+}
+
+// applyRemoteEdits matches every replacement block against the ORIGINAL file content
+// (non-incrementally, rejecting duplicates and overlaps), matching sky-valley/pi/coding's edit contract.
 func applyRemoteEdits(content string, params map[string]any) (string, int, error) {
 	var edits []map[string]any
 	if rawEdits, ok := params["edits"].([]any); ok {
@@ -558,8 +896,9 @@ func applyRemoteEdits(content string, params map[string]any) (string, int, error
 		raw = strings.TrimPrefix(raw, "\uFEFF")
 	}
 	useCRLF := hasCRLFBeforeLF(raw)
-	current := normalizeLF(raw)
+	original := normalizeLF(raw)
 
+	spans := make([]remoteEditSpan, 0, len(edits))
 	for i, e := range edits {
 		oldStr, _ := e["oldText"].(string)
 		newStr, _ := e["newText"].(string)
@@ -568,20 +907,49 @@ func applyRemoteEdits(content string, params map[string]any) (string, int, error
 		if oldNorm == "" {
 			return "", 0, fmt.Errorf("edit block %d: oldText cannot be empty", i+1)
 		}
-		matches := strings.Count(current, oldNorm)
+		matches := strings.Count(original, oldNorm)
 		if matches == 0 {
 			return "", 0, fmt.Errorf("edit block %d: oldText not found in file", i+1)
 		}
 		if matches > 1 {
 			return "", 0, fmt.Errorf("edit block %d: oldText matches %d locations in file; include more surrounding context", i+1, matches)
 		}
-		current = strings.Replace(current, oldNorm, newNorm, 1)
+		idx := strings.Index(original, oldNorm)
+		spans = append(spans, remoteEditSpan{
+			blockIdx: i + 1,
+			start:    idx,
+			end:      idx + len(oldNorm),
+			newText:  newNorm,
+		})
 	}
 
-	if useCRLF {
-		current = strings.ReplaceAll(current, "\n", "\r\n")
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		return spans[i].end < spans[j].end
+	})
+
+	for i := 1; i < len(spans); i++ {
+		if spans[i].start < spans[i-1].end {
+			return "", 0, fmt.Errorf("edit blocks %d and %d overlap in original file; merge nearby changes into one edit", spans[i-1].blockIdx, spans[i].blockIdx)
+		}
 	}
-	return bom + current, len(edits), nil
+
+	var out strings.Builder
+	cursor := 0
+	for _, sp := range spans {
+		out.WriteString(original[cursor:sp.start])
+		out.WriteString(sp.newText)
+		cursor = sp.end
+	}
+	out.WriteString(original[cursor:])
+
+	updated := out.String()
+	if useCRLF {
+		updated = strings.ReplaceAll(updated, "\n", "\r\n")
+	}
+	return bom + updated, len(edits), nil
 }
 
 func normalizeLF(s string) string {

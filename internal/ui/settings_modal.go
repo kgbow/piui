@@ -41,8 +41,9 @@ type SettingsModal struct {
 	ActiveTab  int
 	ShowAPIKey bool
 
-	editing bool
-	draft   store.AppConfig
+	editing   bool
+	draft     store.AppConfig
+	saveError string
 
 	// Model fetching state (per profile ID)
 	fetchingModels bool
@@ -59,9 +60,10 @@ type SettingsModal struct {
 }
 
 // Render draws the Antigravity settings modal when Open is true.
-func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, mgr *harness.Manager, updateUI func(func()), onApply func()) {
+func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, mgr *harness.Manager, updateUI func(func()), onApply func() error) {
 	if !s.Open {
 		s.editing = false
+		s.saveError = ""
 		return
 	}
 	if !s.editing {
@@ -71,6 +73,7 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 		}
 		s.fetchStatus = ""
 		s.fetchError = ""
+		s.saveError = ""
 		s.editing = true
 	}
 
@@ -110,6 +113,14 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 				s.renderSafetyAndSkillsTab(c, p, &s.draft, mgr, skills)
 			}
 
+			if s.saveError != "" {
+				ui.Row(c).FillWidth().Padding(6, 10).Radius(6).
+					Background(p.DangerSoft).Border(1, p.DangerColor).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, IconShieldAlert).Size(13, 13).TextColor(p.DangerColor).Shrink(0)
+					ui.Text(c, s.saveError).Font("Menlo").FontSize(11).TextColor(p.DangerColor).Grow(1).MinWidth(0)
+				})
+			}
+
 			// Modal Footer
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).
 				Padding(10, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
@@ -121,7 +132,12 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 					s.editing = false
 				})
 				renderModalPrimaryBtn(c, p, "保存", func() {
-					s.commitToConfig(cfg, onApply)
+					if err := s.commitToConfig(cfg, onApply); err != nil {
+						s.saveError = err.Error()
+						c.Toast(s.saveError)
+						return
+					}
+					s.saveError = ""
 					s.Open = false
 					s.editing = false
 					c.Toast("配置已保存并立即生效")
@@ -197,7 +213,7 @@ func renderModalPrimaryBtn(c *ui.Context, p Palette, label string, onClick func(
 	}
 }
 
-func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func()) {
+func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func() error) error {
 	for i := range s.draft.Profiles {
 		p := &s.draft.Profiles[i]
 		p.Models = p.AvailableModels()
@@ -228,10 +244,15 @@ func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func()) {
 
 	_ = cfg.ActiveProfile()
 	_ = cfg.ActiveTarget()
-	_ = cfg.Save()
-	if onApply != nil {
-		onApply()
+	if err := cfg.Save(); err != nil {
+		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
+	if onApply != nil {
+		if err := onApply(); err != nil {
+			return fmt.Errorf("应用配置失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *SettingsModal) triggerFetchModels(prof store.ProviderProfile, updateUI func(func())) {
@@ -602,7 +623,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 	})
 }
 
-func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.AppConfig, liveCfg *store.AppConfig, onApply func()) {
+func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.AppConfig, liveCfg *store.AppConfig, onApply func() error) {
 	ui.Column(c).FillWidth().Gap(10).Children(func() {
 		ui.Text(c, "已配置的工作区目标 (支持在同一 Session 对话中随时一键热切换):").
 			Bold().FontSize(12).TextColor(p.TextSecondary)
@@ -712,9 +733,16 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 						s.NewTargetName = ""
 						s.NewTargetWorkDir = ""
 						s.NewTargetSSHHost = ""
-						_ = liveCfg.Save()
-						if onApply != nil {
-							onApply()
+						if err := liveCfg.Save(); err != nil {
+							s.saveError = "保存新增工作区失败: " + err.Error()
+							c.Toast(s.saveError)
+						} else if onApply != nil {
+							if err := onApply(); err != nil {
+								s.saveError = "应用工作区失败: " + err.Error()
+								c.Toast(s.saveError)
+							} else {
+								s.saveError = ""
+							}
 						}
 					}
 				}

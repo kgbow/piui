@@ -1,7 +1,9 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +98,123 @@ func TestThemeAndTargetBadges(t *testing.T) {
 	}
 	if got := sshWT.ToolCardBadge(); got != "SSH · prod-gateway" {
 		t.Fatalf("expected ToolCardBadge='SSH · prod-gateway', got %q", got)
+	}
+}
+
+
+func TestCorruptConfigBackedUpWithoutOverwriting(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	t.Setenv("PIUI_CONFIG_PATH", cfgFile)
+
+	rawCorrupt := []byte(`{"active_profile_id":"openai","profiles":[broken-json`)
+	if err := os.WriteFile(cfgFile, rawCorrupt, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := LoadOrInit(filepath.Join(dir, "workspace"))
+	if cfg.LoadWarning == "" {
+		t.Fatal("expected LoadWarning for corrupted config.json, got empty")
+	}
+	if cfg.BackupPath == "" {
+		t.Fatal("expected BackupPath to be created for corrupted config.json")
+	}
+
+	// Original corrupted file must NOT be silently overwritten with defaults.
+	diskBytes, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("ReadFile original: %v", err)
+	}
+	if string(diskBytes) != string(rawCorrupt) {
+		t.Fatalf("expected corrupted config.json to remain untouched, got %q", string(diskBytes))
+	}
+
+	// Backup file must match raw bytes and carry 0600 permissions.
+	bakInfo, err := os.Stat(cfg.BackupPath)
+	if err != nil {
+		t.Fatalf("Stat backup: %v", err)
+	}
+	if perm := bakInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected backup perm 0600, got %o", perm)
+	}
+	bakBytes, err := os.ReadFile(cfg.BackupPath)
+	if err != nil {
+		t.Fatalf("ReadFile backup: %v", err)
+	}
+	if string(bakBytes) != string(rawCorrupt) {
+		t.Fatalf("expected backup content to equal rawCorrupt, got %q", string(bakBytes))
+	}
+}
+
+func TestEmptyProfilesPreservesTargetsPolicyAndTheme(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	t.Setenv("PIUI_CONFIG_PATH", cfgFile)
+
+	validEmptyProfiles := `{
+  "active_profile_id": "",
+  "profiles": [],
+  "active_target_id": "ssh-staging",
+  "targets": [
+    {
+      "id": "ssh-staging",
+      "name": "SSH: staging",
+      "is_remote": true,
+      "work_dir": "/srv/staging",
+      "ssh_host": "deploy@staging"
+    }
+  ],
+  "safety_policy": "strict-remote",
+  "theme": "light"
+}`
+	if err := os.WriteFile(cfgFile, []byte(validEmptyProfiles), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := LoadOrInit(filepath.Join(dir, "workspace"))
+	if cfg.LoadWarning != "" {
+		t.Fatalf("unexpected LoadWarning for valid JSON with empty profiles: %q", cfg.LoadWarning)
+	}
+	if len(cfg.Profiles) == 0 {
+		t.Fatal("expected default profiles to be populated when profiles array is empty")
+	}
+	if cfg.SafetyPolicy != SafetyPolicyStrictRemote {
+		t.Fatalf("expected SafetyPolicyStrictRemote preserved, got %q", cfg.SafetyPolicy)
+	}
+	if !cfg.IsLightTheme() {
+		t.Fatalf("expected ThemeLight preserved, got %q", cfg.Theme)
+	}
+	if got := cfg.ActiveTarget(); got.ID != "ssh-staging" || got.SSHHost != "deploy@staging" {
+		t.Fatalf("expected ssh-staging target preserved, got %+v", got)
+	}
+}
+
+func TestAtomicSavePermissionsAndNoTempLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	t.Setenv("PIUI_CONFIG_PATH", cfgFile)
+
+	cfg := LoadOrInit(filepath.Join(dir, "workspace"))
+	cfg.SafetyPolicy = SafetyPolicyAlwaysHighRisk
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	info, err := os.Stat(cfgFile)
+	if err != nil {
+		t.Fatalf("Stat config.json: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected 0600 permissions on saved config.json, got %o", perm)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), ".piui-config-") {
+			t.Fatalf("unexpected leftover temp file after atomic Save: %s", ent.Name())
+		}
 	}
 }

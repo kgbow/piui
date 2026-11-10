@@ -77,6 +77,16 @@ func NewDeskApp(workDir string) (*DeskApp, error) {
 	})
 
 	app.mgr = mgr
+	var startupWarns []string
+	if cfg.LoadWarning != "" {
+		startupWarns = append(startupWarns, cfg.LoadWarning)
+	}
+	if warn := mgr.RecorderWarning(); warn != "" {
+		startupWarns = append(startupWarns, warn)
+	}
+	if len(startupWarns) > 0 {
+		app.lastError = strings.Join(startupWarns, " | ")
+	}
 	app.refreshSessionsList()
 	return app, nil
 }
@@ -104,9 +114,36 @@ func (a *DeskApp) currentTurnBadge() (string, bool) {
 	return t.TurnBadge(), t.IsRemote
 }
 
-func (a *DeskApp) currentToolCardBadge() (string, bool) {
-	t := a.mgr.Router().Target()
+func (a *DeskApp) toolCardBadgeFor(toolCallID string) (string, bool) {
+	t := a.mgr.Router().PeekToolTarget(toolCallID)
 	return t.ToolCardBadge(), t.IsRemote
+}
+
+func (a *DeskApp) saveConfigOrWarn(c *ui.Context) bool {
+	if err := a.cfg.Save(); err != nil {
+		msg := "保存配置文件失败: " + err.Error()
+		a.lastError = msg
+		if c != nil {
+			c.Toast(msg)
+		}
+		return false
+	}
+	return true
+}
+
+func (a *DeskApp) applyProfileOrWarn(c *ui.Context, prof *store.ProviderProfile) bool {
+	if a.mgr == nil {
+		return true
+	}
+	if err := a.mgr.ApplyProfile(prof); err != nil {
+		msg := "应用模型渠道配置失败: " + err.Error()
+		a.lastError = msg
+		if c != nil {
+			c.Toast(msg)
+		}
+		return false
+	}
+	return true
 }
 
 func (a *DeskApp) refreshSessionsList() {
@@ -123,24 +160,32 @@ func (a *DeskApp) startNewSession(c *ui.Context) {
 	if a.isRunning || a.mgr == nil {
 		return
 	}
-	if err := a.mgr.InitOrResetSession(a.cfg.ActiveProfile()); err == nil {
-		a.entries = nil
-		a.toolCards = map[string]*ChatEntry{}
-		a.currentAssistant = nil
-		a.lastUserEntry = nil
-		a.activeSessID = ""
-		a.treeSnap = nil
-		a.lastError = ""
-		a.refreshSessionsList()
+	if err := a.mgr.InitOrResetSession(a.cfg.ActiveProfile()); err != nil {
+		a.lastError = "新建会话初始化失败: " + err.Error()
 		if c != nil {
-			c.Toast("已开启新会话")
+			c.Toast(a.lastError)
 		}
+		return
+	}
+	a.entries = nil
+	a.toolCards = map[string]*ChatEntry{}
+	a.currentAssistant = nil
+	a.lastUserEntry = nil
+	a.activeSessID = ""
+	a.treeSnap = nil
+	a.approvalModal.Clear()
+	a.lastError = a.mgr.RecorderWarning()
+	a.refreshSessionsList()
+	if c != nil {
+		c.Toast("已开启新会话")
 	}
 }
 
 func (a *DeskApp) toggleTheme(c *ui.Context) {
 	next := a.cfg.ToggleTheme()
-	_ = a.cfg.Save()
+	if !a.saveConfigOrWarn(c) {
+		return
+	}
 	if c != nil {
 		if next == store.ThemeLight {
 			c.Toast("已切换至浅色主题 (Antigravity Daylight)")
@@ -255,7 +300,7 @@ func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error
 		case agent.EvToolExecutionStart:
 			a.finalizeCurrentAssistant(nil)
 			sum, dOld, dNew := SummarizeToolArgs(ev.ToolName, ev.Args)
-			badge, isRem := a.currentToolCardBadge()
+			badge, isRem := a.toolCardBadgeFor(ev.ToolCallID)
 			card := &ChatEntry{
 				ID:          a.allocID(),
 				Kind:        EntryTool,
@@ -457,12 +502,16 @@ func (a *DeskApp) View(c *ui.Context) {
 	})
 
 	// Settings Modal (API Endpoints, Workspaces & Safety Policy)
-	a.settingsModal.Render(c, p, a.cfg, a.mgr, a.updateUI, func() {
-		_ = a.mgr.ApplyProfile(a.cfg.ActiveProfile())
+	a.settingsModal.Render(c, p, a.cfg, a.mgr, a.updateUI, func() error {
+		if err := a.mgr.ApplyProfile(a.cfg.ActiveProfile()); err != nil {
+			a.lastError = "应用渠道配置失败: " + err.Error()
+			return err
+		}
 		a.mgr.SetSafetyPolicy(a.cfg.SafetyPolicy)
 		if target := a.cfg.ActiveTarget(); target != nil {
 			a.mgr.SwitchTarget(*target)
 		}
+		return nil
 	})
 
 	// Human-in-the-Loop High-Risk Tool Approval Modal
@@ -488,6 +537,7 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 				})
 			})
 
+			hasPendingApproval := a.approvalModal.PendingCount() > 0
 			ui.Scroll(c).MaxHeight(165).FillWidth().Children(func() {
 				ui.Column(c).FillWidth().Gap(3).Children(func() {
 					for i := range a.cfg.Targets {
@@ -506,7 +556,7 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 						}
 
 						b := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(7, 9).Radius(8).
-							Gap(9).AlignItems(ui.Center)
+							Gap(9).AlignItems(ui.Center).Disabled(hasPendingApproval)
 						rowBg := ui.Transparent
 						borderCol := ui.Transparent
 						nameCol := p.TextSecondary
@@ -514,13 +564,18 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 							rowBg = p.BgActive
 							borderCol = p.BorderStrong
 							nameCol = p.TextPrimary
-						} else if b.Hovered() {
+						} else if b.Hovered() && !hasPendingApproval {
 							rowBg = p.BgHover
 							nameCol = p.TextPrimary
 						}
 
+						tip := "热切换执行环境至 " + wt.ShortName() + " (" + wt.DisplaySub() + ")"
+						if hasPendingApproval {
+							tip = "请先处理当前挂起的安全审批弹窗，再切换执行环境"
+						}
+
 						b.Background(rowBg).Border(1, borderCol).
-							Tooltip("热切换执行环境至 " + wt.ShortName() + " (" + wt.DisplaySub() + ")").
+							Tooltip(tip).
 							Children(func() {
 							ui.Row(c).Size(24, 24).Shrink(0).Radius(6).Background(iconBg).
 								AlignItems(ui.Center).Justify(ui.Center).Children(func() {
@@ -539,9 +594,10 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 						})
 						if b.Clicked() {
 							a.cfg.ActiveTargetID = wt.ID
-							_ = a.cfg.Save()
 							a.mgr.SwitchTarget(wt)
-							c.Toast("已热切换执行环境至: " + wt.ShortName())
+							if a.saveConfigOrWarn(c) {
+								c.Toast("已热切换执行环境至: " + wt.ShortName())
+							}
 						}
 					}
 				})
@@ -813,11 +869,9 @@ func (a *DeskApp) renderTreeNodesList(c *ui.Context, p Palette, nodes []harness.
 func (a *DeskApp) switchChannel(c *ui.Context, profileID string) {
 	a.cfg.ActiveProfileID = profileID
 	prof := a.cfg.ActiveProfile()
-	_ = a.cfg.Save()
-	if a.mgr != nil {
-		_ = a.mgr.ApplyProfile(prof)
-	}
-	if c != nil && prof != nil {
+	saved := a.saveConfigOrWarn(c)
+	applied := a.applyProfileOrWarn(c, prof)
+	if saved && applied && c != nil && prof != nil {
 		c.Toast(fmt.Sprintf("已切换渠道至: %s (模型: %s)", prof.Name, prof.ModelID))
 	}
 }
@@ -829,11 +883,9 @@ func (a *DeskApp) switchModel(c *ui.Context, modelID string) {
 	}
 	prof.ModelID = modelID
 	prof.AddModel(modelID)
-	_ = a.cfg.Save()
-	if a.mgr != nil {
-		_ = a.mgr.ApplyProfile(prof)
-	}
-	if c != nil {
+	saved := a.saveConfigOrWarn(c)
+	applied := a.applyProfileOrWarn(c, prof)
+	if saved && applied && c != nil {
 		c.Toast(fmt.Sprintf("已切换模型至: %s (%s)", modelID, prof.Name))
 	}
 }
@@ -846,11 +898,9 @@ func (a *DeskApp) switchChannelAndModel(c *ui.Context, profileID, modelID string
 	}
 	prof.ModelID = modelID
 	prof.AddModel(modelID)
-	_ = a.cfg.Save()
-	if a.mgr != nil {
-		_ = a.mgr.ApplyProfile(prof)
-	}
-	if c != nil {
+	saved := a.saveConfigOrWarn(c)
+	applied := a.applyProfileOrWarn(c, prof)
+	if saved && applied && c != nil {
 		c.Toast(fmt.Sprintf("已切换至渠道 [%s] · 模型 [%s]", prof.Name, modelID))
 	}
 }
@@ -861,11 +911,9 @@ func (a *DeskApp) switchThinkingLevel(c *ui.Context, level string) {
 		return
 	}
 	prof.ThinkingLevel = level
-	_ = a.cfg.Save()
-	if a.mgr != nil {
-		_ = a.mgr.ApplyProfile(prof)
-	}
-	if c != nil {
+	saved := a.saveConfigOrWarn(c)
+	applied := a.applyProfileOrWarn(c, prof)
+	if saved && applied && c != nil {
 		c.Toast("已切换思考深度至: " + level)
 	}
 }
@@ -883,11 +931,9 @@ func (a *DeskApp) switchChannelModelThinking(c *ui.Context, profileID, modelID, 
 	if strings.TrimSpace(thinkingLevel) != "" {
 		prof.ThinkingLevel = thinkingLevel
 	}
-	_ = a.cfg.Save()
-	if a.mgr != nil {
-		_ = a.mgr.ApplyProfile(prof)
-	}
-	if c != nil {
+	saved := a.saveConfigOrWarn(c)
+	applied := a.applyProfileOrWarn(c, prof)
+	if saved && applied && c != nil {
 		c.Toast(fmt.Sprintf("已切换至 %s · %s (Think: %s)", prof.Name, prof.ModelID, capitalizeWord(prof.ThinkingLevel)))
 	}
 }

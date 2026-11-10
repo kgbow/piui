@@ -474,3 +474,63 @@ func TestLongAPIErrorParsingAndLayoutBounds(t *testing.T) {
 		t.Fatalf("expected 'hello' bubble inside CenterMain (<= 1000px), got ok=%v rect=%+v", ok, helloRect)
 	}
 }
+
+
+func TestPersistenceWarningsAndPinnedToolCardBadge(t *testing.T) {
+	tmp := t.TempDir()
+	cfgFile := filepath.Join(tmp, "config.json")
+	if err := os.WriteFile(cfgFile, []byte("{corrupted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make PIUI_SESSION_DIR a regular file so session recorder initialization fails visibly.
+	blockerFile := filepath.Join(tmp, "not-a-dir")
+	if err := os.WriteFile(blockerFile, []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PIUI_CONFIG_PATH", cfgFile)
+	t.Setenv("HOME", blockerFile)
+	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(blockerFile, "agent"))
+
+	app, err := NewDeskApp(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDeskApp should still start with degraded warnings, got err: %v", err)
+	}
+	if !strings.Contains(app.lastError, "JSON 解析失败") || !strings.Contains(app.lastError, ".corrupt-") {
+		t.Fatalf("expected corrupt config warning in app.lastError, got %q", app.lastError)
+	}
+	if !strings.Contains(app.lastError, "不会落盘") {
+		t.Fatalf("expected session recorder warning in app.lastError, got %q", app.lastError)
+	}
+
+	// Make config directory read-only so atomic cfg.Save() fails and surfaces error.
+	if err := os.Chmod(tmp, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(tmp, 0o700) }()
+	app.lastError = ""
+	app.toggleTheme(nil)
+	_ = os.Chmod(tmp, 0o700)
+	if !strings.Contains(app.lastError, "保存") {
+		t.Fatalf("expected cfg.Save failure surfaced in app.lastError, got %q", app.lastError)
+	}
+
+	// Verify pinned tool target badge is used on EvToolExecStart even if router active target changed.
+	pinnedWT := app.mgr.Router().PinToolTarget("tc-pinned-ui")
+	app.mgr.SwitchTarget(store.WorkspaceTarget{
+		ID:       "ssh-other",
+		Name:     "SSH: other-host",
+		IsRemote: true,
+		WorkDir:  "/srv/other",
+		SSHHost:  "other-host",
+	})
+	_ = app.handleAgentEvent(context.Background(), agent.AgentEvent{
+		Type:       agent.EvToolExecutionStart,
+		ToolCallID: "tc-pinned-ui",
+		ToolName:   "bash",
+		Args:       map[string]any{"command": "pwd"},
+	})
+	if len(app.entries) == 0 || app.entries[len(app.entries)-1].TargetBadge != pinnedWT.ToolCardBadge() {
+		t.Fatalf("expected tool card badge=%q from pinned target, got %+v", pinnedWT.ToolCardBadge(), app.entries)
+	}
+}

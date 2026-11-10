@@ -3,9 +3,12 @@ package store
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // APIFormat defines the wire protocol format for the custom LLM endpoint.
@@ -221,7 +224,9 @@ type AppConfig struct {
 	SafetyPolicy    SafetyPolicy      `json:"safety_policy,omitempty"`
 	Theme           string            `json:"theme,omitempty"` // "dark" (default) or "light"
 
-	configPath string `json:"-"`
+	configPath  string `json:"-"`
+	LoadWarning string `json:"-"`
+	BackupPath  string `json:"-"`
 }
 
 // IsLightTheme reports whether the Daylight (light) theme is active.
@@ -271,7 +276,57 @@ func ExpandLocalPath(p string) string {
 	return p
 }
 
-// LoadOrInit loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) or creates sensible defaults.
+func defaultProfiles() []ProviderProfile {
+	return []ProviderProfile{
+		{
+			ID:            "anthropic-default",
+			Name:          "Anthropic / 兼容接口",
+			Format:        FormatAnthropicMessages,
+			BaseURL:       strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")),
+			APIKey:        strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
+			ModelID:       "claude-sonnet-4-5",
+			Models:        []string{"claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"},
+			ThinkingLevel: "medium",
+		},
+		{
+			ID:            "openai-chat",
+			Name:          "OpenAI Chat / 聚合网关",
+			Format:        FormatOpenAICompletions,
+			BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
+			APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+			ModelID:       "gpt-4.1",
+			Models:        []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o4-mini"},
+			ThinkingLevel: "medium",
+		},
+		{
+			ID:            "openai-responses",
+			Name:          "OpenAI Responses API",
+			Format:        FormatOpenAIResponses,
+			BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
+			APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+			ModelID:       "gpt-5",
+			Models:        []string{"gpt-5", "gpt-5-mini", "o3", "gpt-4.1"},
+			ThinkingLevel: "medium",
+		},
+	}
+}
+
+func newDefaultConfig(path, defaultWorkDir string) AppConfig {
+	cfg := AppConfig{
+		configPath:      path,
+		ActiveProfileID: "anthropic-default",
+		SafetyPolicy:    SafetyPolicyRemoteHighRisk,
+		Theme:           ThemeDark,
+		Profiles:        defaultProfiles(),
+	}
+	cfg.ensureProfiles()
+	cfg.ensureTargets(defaultWorkDir)
+	return cfg
+}
+
+// LoadOrInit loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) or initializes defaults
+// only when the file does not exist yet. If an existing file cannot be read or contains
+// corrupted JSON, it preserves/backs up the file without overwriting it and records LoadWarning.
 func LoadOrInit(defaultWorkDir string) *AppConfig {
 	if defaultWorkDir == "" {
 		defaultWorkDir, _ = os.Getwd()
@@ -283,55 +338,41 @@ func LoadOrInit(defaultWorkDir string) *AppConfig {
 
 	path := ConfigPath()
 	data, err := os.ReadFile(path)
-	var cfg AppConfig
-	if err == nil && json.Unmarshal(data, &cfg) == nil && len(cfg.Profiles) > 0 {
-		cfg.configPath = path
-		cfg.ensureProfiles()
-		cfg.ensureTargets(defaultWorkDir)
+	if err != nil {
+		cfg := newDefaultConfig(path, defaultWorkDir)
+		if errors.Is(err, os.ErrNotExist) {
+			if saveErr := cfg.Save(); saveErr != nil {
+				cfg.LoadWarning = fmt.Sprintf("初始化保存配置文件 %s 失败: %v", ShortenHomePath(path), saveErr)
+			}
+			return &cfg
+		}
+		// Existing file could not be read (e.g. permission denied): do NOT overwrite it.
+		cfg.LoadWarning = fmt.Sprintf("读取配置文件 %s 失败: %v（已使用临时默认配置启动，原文件未被覆盖）", ShortenHomePath(path), err)
 		return &cfg
 	}
 
-	cfg = AppConfig{
-		configPath:      path,
-		ActiveProfileID: "anthropic-default",
-		SafetyPolicy:    SafetyPolicyRemoteHighRisk,
-		Theme:           ThemeDark,
-		Profiles: []ProviderProfile{
-			{
-				ID:            "anthropic-default",
-				Name:          "Anthropic / 兼容接口",
-				Format:        FormatAnthropicMessages,
-				BaseURL:       strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")),
-				APIKey:        strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
-				ModelID:       "claude-sonnet-4-5",
-				Models:        []string{"claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"},
-				ThinkingLevel: "medium",
-			},
-			{
-				ID:            "openai-chat",
-				Name:          "OpenAI Chat / 聚合网关",
-				Format:        FormatOpenAICompletions,
-				BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
-				APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-				ModelID:       "gpt-4.1",
-				Models:        []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o4-mini"},
-				ThinkingLevel: "medium",
-			},
-			{
-				ID:            "openai-responses",
-				Name:          "OpenAI Responses API",
-				Format:        FormatOpenAIResponses,
-				BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
-				APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-				ModelID:       "gpt-5",
-				Models:        []string{"gpt-5", "gpt-5-mini", "o3", "gpt-4.1"},
-				ThinkingLevel: "medium",
-			},
-		},
+	var cfg AppConfig
+	if unmarshalErr := json.Unmarshal(data, &cfg); unmarshalErr != nil {
+		fallback := newDefaultConfig(path, defaultWorkDir)
+		backupPath := fmt.Sprintf("%s.corrupt-%s.bak", path, time.Now().Format("20060102-150405"))
+		if bErr := os.WriteFile(backupPath, data, 0o600); bErr == nil {
+			fallback.BackupPath = backupPath
+			fallback.LoadWarning = fmt.Sprintf(
+				"配置文件 %s JSON 解析失败 (%v)；已备份损坏文件至 %s 并以默认配置运行（未覆盖原文件）",
+				ShortenHomePath(path), unmarshalErr, ShortenHomePath(backupPath),
+			)
+		} else {
+			fallback.LoadWarning = fmt.Sprintf(
+				"配置文件 %s JSON 解析失败 (%v)，且创建备份失败 (%v)；已以内存默认配置运行（未覆盖原文件）",
+				ShortenHomePath(path), unmarshalErr, bErr,
+			)
+		}
+		return &fallback
 	}
+
+	cfg.configPath = path
 	cfg.ensureProfiles()
 	cfg.ensureTargets(defaultWorkDir)
-	_ = cfg.Save()
 	return &cfg
 }
 
@@ -356,6 +397,9 @@ func (c *AppConfig) Clone() AppConfig {
 }
 
 func (c *AppConfig) ensureProfiles() {
+	if len(c.Profiles) == 0 {
+		c.Profiles = defaultProfiles()
+	}
 	for i := range c.Profiles {
 		p := &c.Profiles[i]
 		p.Models = p.AvailableModels()
@@ -365,6 +409,16 @@ func (c *AppConfig) ensureProfiles() {
 		if p.ThinkingLevel == "" {
 			p.ThinkingLevel = "medium"
 		}
+	}
+	validActive := false
+	for i := range c.Profiles {
+		if c.Profiles[i].ID == c.ActiveProfileID {
+			validActive = true
+			break
+		}
+	}
+	if !validActive && len(c.Profiles) > 0 {
+		c.ActiveProfileID = c.Profiles[0].ID
 	}
 }
 
@@ -429,21 +483,56 @@ func (c *AppConfig) ensureTargets(defaultWorkDir string) {
 	}
 }
 
-// Save writes the configuration to ~/.config/piui/config.json (or the configured path).
+// Save atomically writes the configuration to ~/.config/piui/config.json (or the configured path)
+// via a same-directory 0600 temporary file, fsync, and atomic rename.
 func (c *AppConfig) Save() error {
 	path := c.configPath
 	if path == "" {
 		path = ConfigPath()
 		c.configPath = path
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	data = append(data, '\n')
+
+	tmpFile, err := os.CreateTemp(dir, ".piui-config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 // ActiveProfile returns a pointer to the currently selected ProviderProfile.
