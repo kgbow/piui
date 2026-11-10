@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -456,6 +457,7 @@ func TestLongAPIErrorParsingAndLayoutBounds(t *testing.T) {
 		},
 	}
 
+	app.termDrawer.Open = true
 	tester := ui.NewTester(app.View, 1360, 840)
 
 	// Verify right-side top-bar icon buttons and right-side TermDrawer stay inside the 1360px window!
@@ -532,5 +534,265 @@ func TestPersistenceWarningsAndPinnedToolCardBadge(t *testing.T) {
 	})
 	if len(app.entries) == 0 || app.entries[len(app.entries)-1].TargetBadge != pinnedWT.ToolCardBadge() {
 		t.Fatalf("expected tool card badge=%q from pinned target, got %+v", pinnedWT.ToolCardBadge(), app.entries)
+	}
+}
+
+func TestCaptureVisualSnapshots(t *testing.T) {
+	outDir := os.Getenv("PIUI_SCREENSHOT_DIR")
+	if outDir == "" {
+		t.Skip("set PIUI_SCREENSHOT_DIR to export PNG UI snapshots")
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PIUI_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("PIUI_SESSION_DIR", filepath.Join(t.TempDir(), "sessions"))
+
+	app, err := NewDeskApp(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.cfg.Targets = append(app.cfg.Targets, store.WorkspaceTarget{
+		ID:       "ssh-prod",
+		Name:     "prod-gateway",
+		IsRemote: true,
+		WorkDir:  "/srv/gateway",
+		SSHHost:  "prod-gateway",
+	})
+	app.savedSessions = []harness.SavedSessionSummary{
+		{ID: "s1", Title: "排查生产网关连接池超时与重试雪崩", Timestamp: "11-10 22:14", Messages: 12},
+		{ID: "s2", Title: "重构用户权限鉴权中间件与单元测试", Timestamp: "11-09 16:30", Messages: 8},
+	}
+	app.activeSessID = "s1"
+
+	saveSnap := func(tester *ui.Tester, name string) {
+		tester.Frame()
+		img := tester.Image()
+		f, err := os.Create(filepath.Join(outDir, name+".png"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := png.Encode(f, img); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tester := ui.NewTester(app.View, 1360, 840)
+	tester.SetScale(2)
+	tester.SetTitleBar(ui.TitleBar{Height: 28, Left: 78})
+
+	// 1. Empty state (Dark)
+	saveSnap(tester, "01_empty_dark")
+
+	// 2. Rich Chat + Tool Cards + Code Block + TermDrawer (Dark)
+	app.termDrawer.Open = true
+	app.termDrawer.AppendChunk("[ssh:prod-gateway:/srv/gateway] $ nginx -t\nnginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful\n[exit code: 0 · 18ms]\n")
+	app.entries = []*ChatEntry{
+		{
+			ID:          app.allocID(),
+			Kind:        EntryUser,
+			Text:        "帮我检查远程网关的 upstream 超时配置，把 keepalive_timeout 调优到 65s 并验证语法。",
+			TargetBadge: "prod-gateway (SSH)",
+			IsRemote:    true,
+			EntryID:     "e101a2b",
+			Done:        true,
+		},
+		{
+			ID:          app.allocID(),
+			Kind:        EntryAssistant,
+			Thinking:    "先读取 /srv/gateway/conf.d/upstream.conf 确认当前 keepalive_timeout 参数，再通过 edit 修改并用 nginx -t 验证配置有效性。",
+			ThinkOpen:   false,
+			Text:        "我来先检查并更新远端 `upstream.conf` 的连接保持超时设置：",
+			TargetBadge: "prod-gateway (SSH)",
+			IsRemote:    true,
+			EntryID:     "e102b3c",
+			Done:        true,
+		},
+		{
+			ID:          app.allocID(),
+			Kind:        EntryTool,
+			ToolCallID:  "tc-read",
+			ToolName:    "read",
+			ToolSummary: "/srv/gateway/conf.d/upstream.conf",
+			TargetBadge: "Local · piui",
+			IsRemote:    false,
+			DurationMs:  19,
+			CardOpen:    false,
+			Done:        true,
+		},
+		{
+			ID:          app.allocID(),
+			Kind:        EntryTool,
+			ToolCallID:  "tc-edit",
+			ToolName:    "edit",
+			ToolSummary: "/srv/gateway/conf.d/upstream.conf",
+			DiffOld:     "upstream api_backend {\n    keepalive 32;\n    keepalive_timeout 5s;\n}",
+			DiffNew:     "upstream api_backend {\n    keepalive 64;\n    keepalive_timeout 65s;\n}",
+			ToolOutput:  "Updated 1 hunk in /srv/gateway/conf.d/upstream.conf",
+			TargetBadge: "SSH · prod-gateway",
+			IsRemote:    true,
+			DurationMs:  138,
+			CardOpen:    true,
+			Done:        true,
+		},
+		{
+			ID:      app.allocID(),
+			Kind:    EntryAssistant,
+			Text:    "已完成参数调优并通过 `nginx -t` 校验。核心变更如下：\n\n```nginx\nupstream api_backend {\n    keepalive 64;\n    keepalive_timeout 65s;\n}\n```\n\n如需平滑生效，确认后即可执行 `nginx -s reload`。",
+			EntryID: "e105f9a",
+			Done:    true,
+		},
+	}
+	app.treeSnap = &harness.SessionTreeSnapshot{
+		SessionID:    "s1",
+		ActiveLeafID: "e105f9a",
+		BranchCount:  2,
+		TotalEntries: 5,
+		Nodes: []harness.SessionTreeNode{
+			{EntryID: "e101a2b", Role: "user", Label: "帮我检查远程网关的 upstream 超时配置", OnActiveBranch: true, IsForkPoint: true},
+			{EntryID: "e102old", Role: "assistant", Label: "直接执行 systemctl restart nginx", Depth: 1, BranchIndex: 1, TotalBranches: 2, IsLeaf: true},
+			{EntryID: "e102b3c", Role: "assistant", Label: "先检查并更新 upstream.conf 设置", Depth: 1, BranchIndex: 2, TotalBranches: 2, OnActiveBranch: true},
+			{EntryID: "e105f9a", Role: "assistant", Label: "已完成参数调优并通过 nginx -t 校验", Depth: 1, OnActiveBranch: true, IsActiveCursor: true, IsLeaf: true},
+		},
+	}
+	saveSnap(tester, "02_chat_dark")
+
+	// 3. Branch Tree + Light Theme
+	app.sidebarTab = 1
+	app.toggleTheme(nil)
+	saveSnap(tester, "03_chat_tree_light")
+
+	// 4. Settings Modal Tab 0 (Dark)
+	app.toggleTheme(nil)
+	app.settingsModal.Open = true
+	app.settingsModal.ActiveTab = 0
+	saveSnap(tester, "04_settings_tab0_dark")
+
+	// 5. Settings Modal Tab 1 (Light)
+	app.toggleTheme(nil)
+	app.settingsModal.ActiveTab = 1
+	saveSnap(tester, "05_settings_tab1_light")
+
+	// 6. Settings Modal Tab 2 (Dark)
+	app.toggleTheme(nil)
+	app.settingsModal.ActiveTab = 2
+	saveSnap(tester, "06_settings_tab2_dark")
+
+	// 7. Approval Modal (Dark)
+	app.settingsModal.Open = false
+	app.approvalModal.Enqueue(&harness.ApprovalRequest{
+		ID:       "req-1",
+		ToolName: "bash",
+		Target: store.WorkspaceTarget{
+			ID:       "ssh-prod",
+			Name:     "prod-gateway",
+			IsRemote: true,
+			WorkDir:  "/srv/gateway",
+			SSHHost:  "prod-gateway",
+		},
+		Assessment: harness.RiskAssessment{
+			Level:    harness.RiskHigh,
+			Category: "远程服务重载 / 进程变更",
+			Reason:   "在远端 SSH 主机上执行 nginx 服务变更指令，可能影响线上流量",
+			Preview:  "sudo nginx -s reload",
+		},
+	})
+	saveSnap(tester, "07_approval_dark")
+	app.approvalModal.Clear()
+
+	// 8. Collapsed Left Sidebar + Expanded Thinking (Dark)
+	app.sidebarCollapsed = true
+	app.termDrawer.Open = false
+	app.termDrawer.Unread = true
+	app.entries[1].ThinkOpen = true
+	saveSnap(tester, "08_collapsed_sidebar_dark")
+}
+
+func TestSettingsModalFixedHeightSidebarCollapseAndTreeTopology(t *testing.T) {
+	t.Setenv("PIUI_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("PIUI_SESSION_DIR", filepath.Join(t.TempDir(), "sessions"))
+
+	app, err := NewDeskApp(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewDeskApp: %v", err)
+	}
+
+	// 1. TermDrawer starts closed by default, marks Unread when closed, and clears Unread when rendered open
+	if app.termDrawer.Open {
+		t.Fatal("expected TermDrawer to start closed for calm initial layout")
+	}
+	app.termDrawer.AppendChunk("$ echo hi\nhi\n")
+	if !app.termDrawer.Unread {
+		t.Fatal("expected TermDrawer.Unread=true when chunk arrives while closed")
+	}
+
+	tester := ui.NewTester(app.View, 1360, 840)
+
+	// 2. Verify Cmd+B collapses sidebar and topbar expand button restores it
+	tester.Key(ui.Cmd, ui.Key('b'))
+	if !app.sidebarCollapsed {
+		t.Fatal("expected Cmd+B to collapse left sidebar")
+	}
+	expandBtn, ok := tester.Access("展开侧边栏 (Ctrl/Cmd+B)")
+	if !ok {
+		t.Fatal("expected expand-sidebar button in topbar when collapsed")
+	}
+	tester.ClickAt(expandBtn.Bounds.X+expandBtn.Bounds.W/2, expandBtn.Bounds.Y+expandBtn.Bounds.H/2)
+	if app.sidebarCollapsed {
+		t.Fatal("expected clicking expand button to restore left sidebar")
+	}
+
+	// Opening TermDrawer clears Unread on render
+	app.termDrawer.Open = true
+	tester.Frame()
+	if app.termDrawer.Unread {
+		t.Fatal("expected TermDrawer.Unread to clear once rendered open")
+	}
+
+	// 3. Verify SettingsModal maintains identical 560px dialog height across all 3 tabs
+	app.settingsModal.Open = true
+	var tabHeights [3]float32
+	for tab := 0; tab < 3; tab++ {
+		app.settingsModal.ActiveTab = tab
+		tester.Frame()
+		dlg, ok := tester.AccessByRole(ui.RoleDialog, "")
+		if !ok {
+			t.Fatalf("expected RoleDialog on tab %d", tab)
+		}
+		if dlg.Bounds.H != 560 {
+			t.Fatalf("expected SettingsModal RoleDialog height=560 on tab %d, got %.1f", tab, dlg.Bounds.H)
+		}
+		tabHeights[tab] = dlg.Bounds.H
+	}
+	if tabHeights[0] != tabHeights[1] || tabHeights[1] != tabHeights[2] {
+		t.Fatalf("expected zero height jump across tabs, got %+v", tabHeights)
+	}
+
+	// 4. Verify DFS vector tree trunk continuation geometry
+	nodes := []harness.SessionTreeNode{
+		{EntryID: "root", Depth: 0, IsForkPoint: true},
+		{EntryID: "b1", Depth: 1, BranchIndex: 1, TotalBranches: 2, IsLeaf: true},
+		{EntryID: "b2", Depth: 1, BranchIndex: 2, TotalBranches: 2, IsLeaf: false},
+		{EntryID: "b2-child", Depth: 1, BranchIndex: 0, IsLeaf: true},
+	}
+	if !treeColumnContinuesBelow(nodes, 0, 0) {
+		t.Fatal("root col 0 should continue below to feed branches")
+	}
+	if !treeColumnContinuesBelow(nodes, 1, 0) {
+		t.Fatal("b1 col 0 should continue below to feed sibling b2")
+	}
+	if treeColumnContinuesBelow(nodes, 1, 1) {
+		t.Fatal("b1 col 1 is a leaf and must NOT connect to sibling b2")
+	}
+	if treeColumnContinuesBelow(nodes, 2, 0) {
+		t.Fatal("b2 is the last branch of root; col 0 must stop at elbow")
+	}
+	if !treeColumnContinuesBelow(nodes, 2, 1) {
+		t.Fatal("b2 col 1 should continue below to linear child b2-child")
+	}
+	if treeColumnContinuesBelow(nodes, 3, 0) || treeColumnContinuesBelow(nodes, 3, 1) {
+		t.Fatal("last node must not continue any column below")
 	}
 }

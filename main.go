@@ -23,13 +23,15 @@ func main() {
 
 	mygo.App.WhenReady(func() {
 		win := mygo.NewWindow(mygo.WindowOptions{
-			Title:     "PiUI — Native Pi Agent Desk",
-			Width:     1360,
-			Height:    840,
-			MinWidth:  920,
-			MinHeight: 580,
-			StateKey:  "piui-main-window",
-			Content:   ui.View(app.View),
+			Title:           "PiUI — Native Pi Agent Desk",
+			Width:           1360,
+			Height:          840,
+			MinWidth:        920,
+			MinHeight:       580,
+			TitleBarStyle:   mygo.TitleBarHiddenInset,
+			BackgroundColor: "light-dark(#FAFAFC, #0E0E12)",
+			StateKey:        "piui-main-window",
+			Content:         ui.View(app.View),
 		})
 		app.BindWindow(win)
 	})

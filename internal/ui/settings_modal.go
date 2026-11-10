@@ -59,7 +59,7 @@ type SettingsModal struct {
 	NewTargetSSHHost string
 }
 
-// Render draws the Antigravity settings modal when Open is true.
+// Render draws the Antigravity settings modal with fixed height so tab switches never jump.
 func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, mgr *harness.Manager, updateUI func(func()), onApply func() error) {
 	if !s.Open {
 		s.editing = false
@@ -82,56 +82,66 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 		skills = mgr.DiscoverSkills()
 	}
 
-	ui.Modal(c, &s.Open, func() {
-		ui.Column(c).Width(620).Gap(12).Children(func() {
-			// Modal Header
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).
-				Padding(0, 0, 8, 0).BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
+	AppDialog(c, p, &s.Open, 640, 560, func() {
+		ui.Column(c).Fill().Children(func() {
+			// Edge-to-Edge Modal Header (48px)
+			ui.Row(c).FillWidth().Height(48).Padding(0, 14, 0, 20).Shrink(0).
+				AlignItems(ui.Center).Gap(8).
+				BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
 				ui.Icon(c, IconSettings).Size(15, 15).TextColor(p.TextSecondary)
-				ui.Text(c, "渠道模型、工作区与安全审批设置").Bold().FontSize(14.5).TextColor(p.TextPrimary)
+				ui.Text(c, "偏好设置").FontWeight(WeightSemibold).FontSize(FontTitle).TextColor(p.TextPrimary)
+				ui.Text(c, "渠道模型 · 工作区 · 安全策略").FontSize(FontSmall).TextColor(p.TextMuted).Padding(0, 4)
 				ui.Spacer(c)
-				IconTipBtn(c, p, IconCross, 26, 14, "关闭设置", func() {
+				IconTipBtn(c, p, IconCross, 28, 14, "关闭设置 (Esc)", func() {
 					s.Open = false
 					s.editing = false
 				})
 			})
 
-			// 3-Segment Tab Bar
-			tabTitles := []string{
-				"渠道与模型",
-				fmt.Sprintf("工作区 (%d)", len(s.draft.Targets)),
-				fmt.Sprintf("安全与 Skills (%d)", len(skills)),
-			}
-			renderSegmentedBar(c, p, &s.ActiveTab, tabTitles)
+			// Fixed 3-Segment Navigation Bar
+			ui.Column(c).FillWidth().Shrink(0).Padding(12, 20, 6, 20).Children(func() {
+				tabTitles := []string{
+					"渠道与模型",
+					fmt.Sprintf("工作区 (%d)", len(s.draft.Targets)),
+					fmt.Sprintf("安全与 Skills (%d)", len(skills)),
+				}
+				SegmentedBar(c, p, &s.ActiveTab, tabTitles)
+			})
 
-			switch s.ActiveTab {
-			case 0:
-				s.renderProviderTab(c, p, &s.draft, updateUI)
-			case 1:
-				s.renderTargetsTab(c, p, &s.draft, cfg, onApply)
-			default:
-				s.renderSafetyAndSkillsTab(c, p, &s.draft, mgr, skills)
-			}
+			// Scrollable Tab Content Body (absorbs height differences so modal never jumps!)
+			ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+				ui.Column(c).FillWidth().Padding(8, 20, 16, 20).Children(func() {
+					switch s.ActiveTab {
+					case 0:
+						s.renderProviderTab(c, p, &s.draft, updateUI)
+					case 1:
+						s.renderTargetsTab(c, p, &s.draft, cfg, onApply)
+					default:
+						s.renderSafetyAndSkillsTab(c, p, &s.draft, mgr, skills)
+					}
+				})
+			})
 
 			if s.saveError != "" {
-				ui.Row(c).FillWidth().Padding(6, 10).Radius(6).
-					Background(p.DangerSoft).Border(1, p.DangerColor).Gap(6).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, IconShieldAlert).Size(13, 13).TextColor(p.DangerColor).Shrink(0)
-					ui.Text(c, s.saveError).Font("Menlo").FontSize(11).TextColor(p.DangerColor).Grow(1).MinWidth(0)
+				ui.Row(c).FillWidth().Shrink(0).Margin(0, 20, 8, 20).Padding(7, 10).Radius(RadiusSM).
+					Background(p.DangerSoft).Border(1, p.DangerColor.Alpha(0.4)).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, IconShieldAlert).Size(13.5, 13.5).TextColor(p.DangerColor).Shrink(0)
+					ui.Text(c, s.saveError).FontSize(FontCaption).TextColor(p.DangerColor).Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
 				})
 			}
 
-			// Modal Footer
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).
-				Padding(10, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
+			// Edge-to-Edge Modal Footer (52px)
+			ui.Row(c).FillWidth().Height(52).Padding(0, 20).Shrink(0).
+				AlignItems(ui.Center).Gap(10).Background(p.BgSidebar).
+				BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
 				ui.Text(c, store.ShortenHomePath(store.ConfigPath())).
-					Font("Menlo").FontSize(11).TextColor(p.TextMuted)
-				ui.Spacer(c)
-				renderModalGhostBtn(c, p, "取消", func() {
+					Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted).
+					Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
+				GhostBtn(c, p, nil, "取消", "放弃未保存的更改", func() {
 					s.Open = false
 					s.editing = false
 				})
-				renderModalPrimaryBtn(c, p, "保存", func() {
+				PrimaryBtn(c, p, nil, "保存更改", "保存并立即应用当前配置", func() {
 					if err := s.commitToConfig(cfg, onApply); err != nil {
 						s.saveError = err.Error()
 						c.Toast(s.saveError)
@@ -148,68 +158,6 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 
 	if !s.Open {
 		s.editing = false
-	}
-}
-
-func renderSegmentedBar(c *ui.Context, p Palette, activeIdx *int, labels []string) {
-	ui.Row(c).FillWidth().Padding(3, 3).Radius(8).
-		Background(p.BgSidebar).Border(1, p.BorderSubtle).Gap(3).Children(func() {
-		for i, lbl := range labels {
-			idx := i
-			text := lbl
-			active := *activeIdx == idx
-			b := ui.ButtonBase(c).Grow(1).Padding(6, 8).Radius(6).
-				AlignItems(ui.Center).Justify(ui.Center)
-			bg := ui.Transparent
-			fg := p.TextMuted
-			borderCol := ui.Transparent
-			if active {
-				bg = p.BgElevated
-				fg = p.TextPrimary
-				borderCol = p.BorderSubtle
-			} else if b.Hovered() {
-				fg = p.TextSecondary
-			}
-			b.Background(bg).Border(1, borderCol).Children(func() {
-				el := ui.Text(c, text).FontSize(12).TextColor(fg)
-				if active {
-					el.Bold()
-				}
-			})
-			if b.Clicked() {
-				*activeIdx = idx
-			}
-		}
-	})
-}
-
-func renderModalGhostBtn(c *ui.Context, p Palette, label string, onClick func()) {
-	b := ui.ButtonBase(c).Padding(6, 13).Radius(7).Border(1, p.BorderStrong).AlignItems(ui.Center)
-	bg := ui.Transparent
-	fg := p.TextSecondary
-	if b.Hovered() || b.Pressed() {
-		bg = p.BgHover
-		fg = p.TextPrimary
-	}
-	b.Background(bg).Children(func() {
-		ui.Text(c, label).FontSize(12).TextColor(fg)
-	})
-	if b.Clicked() && onClick != nil {
-		onClick()
-	}
-}
-
-func renderModalPrimaryBtn(c *ui.Context, p Palette, label string, onClick func()) {
-	b := ui.ButtonBase(c).Padding(6, 14).Radius(7).AlignItems(ui.Center)
-	bg := p.BtnPrimaryBg
-	if b.Hovered() {
-		bg = bg.Alpha(0.9)
-	}
-	b.Background(bg).Children(func() {
-		ui.Text(c, label).Bold().FontSize(12).TextColor(p.BtnPrimaryFg)
-	})
-	if b.Clicked() && onClick != nil {
-		onClick()
 	}
 }
 
@@ -287,7 +235,7 @@ func (s *SettingsModal) triggerFetchModels(prof store.ProviderProfile, updateUI 
 				s.fetchedModels = map[string][]string{}
 			}
 			s.fetchedModels[profID] = models
-			s.fetchStatus = fmt.Sprintf("✓ 成功从 /v1/models 拉取 %d 个模型，勾选后即可在主界面快捷切换", len(models))
+			s.fetchStatus = fmt.Sprintf("已从 /v1/models 拉取 %d 个模型，勾选后即可在主界面快捷切换", len(models))
 
 			for i := range s.draft.Profiles {
 				if s.draft.Profiles[i].ID == profID {
@@ -334,130 +282,136 @@ func (s *SettingsModal) candidateModelsFor(prof *store.ProviderProfile) []string
 }
 
 func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store.AppConfig, updateUI func(func())) {
-	// Channel pill strip (.chan-strip)
-	ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
-		for i := range draft.Profiles {
-			profItem := &draft.Profiles[i]
-			active := profItem.ID == draft.ActiveProfileID
-			profID := profItem.ID
-			profName := profItem.Name
+	ui.Column(c).FillWidth().Gap(12).Children(func() {
+		// Channel pill strip — neutral by default, crisp active indicator
+		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
+			for i := range draft.Profiles {
+				profItem := &draft.Profiles[i]
+				active := profItem.ID == draft.ActiveProfileID
+				profID := profItem.ID
+				profName := profItem.Name
 
-			b := ui.ButtonBase(c).Padding(5, 11).Radius(7).Gap(6).AlignItems(ui.Center)
-			bg := p.BgSurface
-			fg := p.TextSecondary
-			borderCol := p.BorderSubtle
-			dotCol := p.TextMuted
-			if active {
-				bg = p.BgActive
-				fg = p.TextPrimary
-				borderCol = p.BorderStrong
-				dotCol = p.LocalColor
-			} else if b.Hovered() {
-				bg = p.BgHover
-				fg = p.TextPrimary
-			}
-			b.Background(bg).Border(1, borderCol).Children(func() {
-				ui.Box(c).Size(6, 6).Radius(99).Background(dotCol)
-				el := ui.Text(c, profName).FontSize(12).TextColor(fg)
+				b := ui.ButtonBase(c).Height(28).Padding(0, 11).Radius(RadiusSM).Gap(6).AlignItems(ui.Center)
+				bg := p.InputBg
+				fg := p.TextSecondary
+				borderCol := p.BorderSubtle
 				if active {
-					el.Bold()
+					bg = p.BgElevated
+					if p.IsLight {
+						bg = p.BgSurface
+					}
+					fg = p.TextPrimary
+					borderCol = p.BorderStrong
+				} else if b.Hovered() {
+					bg = p.BgHover
+					fg = p.TextPrimary
 				}
-			})
-			if b.Clicked() {
-				draft.ActiveProfileID = profID
+				b.Background(bg).Border(1, borderCol).Children(func() {
+					if active {
+						ui.Box(c).Size(5, 5).Radius(RadiusPill).Background(p.Accent)
+					}
+					el := ui.Text(c, profName).FontSize(FontSmall).TextColor(fg).SingleLine()
+					if active {
+						el.FontWeight(WeightMedium)
+					}
+				})
+				if b.Clicked() {
+					draft.ActiveProfileID = profID
+					s.fetchStatus = ""
+					s.fetchError = ""
+				}
+			}
+
+			ui.Spacer(c)
+
+			ToolbarIconBtn(c, p, IconPlus, 28, 14, false, ui.Transparent, "新增模型渠道", func() {
+				id := fmt.Sprintf("channel-%d", time.Now().Unix()%10000)
+				draft.Profiles = append(draft.Profiles, store.ProviderProfile{
+					ID:            id,
+					Name:          "新建渠道",
+					Format:        store.FormatOpenAICompletions,
+					BaseURL:       "https://api.openai.com/v1",
+					ModelID:       "",
+					Models:        nil,
+					ThinkingLevel: "medium",
+				})
+				draft.ActiveProfileID = id
 				s.fetchStatus = ""
 				s.fetchError = ""
-			}
-		}
-
-		ui.Spacer(c)
-
-		ToolbarIconBtn(c, p, IconPlus, 28, 14, false, ui.Transparent, "新增模型渠道", func() {
-			id := fmt.Sprintf("channel-%d", time.Now().Unix()%10000)
-			draft.Profiles = append(draft.Profiles, store.ProviderProfile{
-				ID:            id,
-				Name:          "新建渠道",
-				Format:        store.FormatOpenAICompletions,
-				BaseURL:       "https://api.openai.com/v1",
-				ModelID:       "",
-				Models:        nil,
-				ThinkingLevel: "medium",
 			})
-			draft.ActiveProfileID = id
-			s.fetchStatus = ""
-			s.fetchError = ""
+
+			if len(draft.Profiles) > 1 {
+				DangerIconBtn(c, p, IconTrash, 28, 13.5, "删除当前渠道", func() {
+					for i := range draft.Profiles {
+						if draft.Profiles[i].ID == draft.ActiveProfileID {
+							draft.Profiles = append(draft.Profiles[:i], draft.Profiles[i+1:]...)
+							break
+						}
+					}
+					_ = draft.ActiveProfile()
+					s.fetchStatus = ""
+					s.fetchError = ""
+				})
+			}
 		})
 
-		if len(draft.Profiles) > 1 {
-			DangerIconBtn(c, p, IconTrash, 28, 13.5, "删除当前渠道", func() {
-				for i := range draft.Profiles {
-					if draft.Profiles[i].ID == draft.ActiveProfileID {
-						draft.Profiles = append(draft.Profiles[:i], draft.Profiles[i+1:]...)
-						break
-					}
-				}
-				_ = draft.ActiveProfile()
-				s.fetchStatus = ""
-				s.fetchError = ""
-			})
+		prof := draft.ActiveProfile()
+		if prof == nil {
+			return
 		}
-	})
 
-	prof := draft.ActiveProfile()
-	if prof == nil {
-		return
-	}
-
-	fmtIdx := 0
-	for i, fv := range formatValues {
-		if prof.Format == fv {
-			fmtIdx = i
-			break
+		fmtIdx := 0
+		for i, fv := range formatValues {
+			if prof.Format == fv {
+				fmtIdx = i
+				break
+			}
 		}
-	}
 
-	thinkIdx := 2
-	for i, tv := range thinkingValues {
-		if prof.ThinkingLevel == tv {
-			thinkIdx = i
-			break
+		thinkIdx := 2
+		for i, tv := range thinkingValues {
+			if prof.ThinkingLevel == tv {
+				thinkIdx = i
+				break
+			}
 		}
-	}
 
-	candidates := s.candidateModelsFor(prof)
+		candidates := s.candidateModelsFor(prof)
 
-	ui.Column(c).FillWidth().Gap(9).Children(func() {
 		// 2-column Name & BaseURL
-		ui.Row(c).FillWidth().Gap(10).Children(func() {
-			ui.Column(c).Grow(1).Gap(4).Children(func() {
-				ui.Text(c, "渠道名称 (Channel Name)").FontSize(11.5).TextColor(p.TextSecondary)
+		ui.Row(c).FillWidth().Gap(12).Children(func() {
+			ui.Column(c).Grow(1).Gap(5).Children(func() {
+				ui.Text(c, "渠道名称").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
 				ui.TextInput(c, &prof.Name).FillWidth().Placeholder("例如：OpenRouter / DeepSeek / 聚合网关")
 			})
-			ui.Column(c).Grow(1).Gap(4).Children(func() {
+			ui.Column(c).Grow(1).Gap(5).Children(func() {
 				basePlaceholder := "https://api.openai.com/v1"
 				if prof.Format == store.FormatAnthropicMessages {
 					basePlaceholder = "https://api.anthropic.com"
 				}
-				ui.Text(c, "Base URL (接口地址)").FontSize(11.5).TextColor(p.TextSecondary)
-				ui.TextInput(c, &prof.BaseURL).FillWidth().Font("Menlo").Placeholder(basePlaceholder)
+				ui.Text(c, "接口地址 (Base URL)").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+				ui.TextInput(c, &prof.BaseURL).FillWidth().Font(FontMono).Placeholder(basePlaceholder)
 			})
 		})
 
 		// Wire format 3-way segmented bar
-		ui.Column(c).FillWidth().Gap(4).Children(func() {
-			ui.Text(c, "接口协议格式 (API Wire Format)").FontSize(11.5).TextColor(p.TextSecondary)
+		ui.Column(c).FillWidth().Gap(5).Children(func() {
+			ui.Text(c, "接口协议格式").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
 			prevFmt := fmtIdx
-			renderSegmentedBar(c, p, &fmtIdx, formatLabels)
+			SegmentedBar(c, p, &fmtIdx, formatLabels)
 			if fmtIdx != prevFmt {
 				prof.Format = formatValues[fmtIdx]
 			}
 		})
 
 		// API Key input
-		ui.Column(c).FillWidth().Gap(4).Children(func() {
-			ui.Text(c, "API Key (留空读取环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY)").FontSize(11.5).TextColor(p.TextSecondary)
+		ui.Column(c).FillWidth().Gap(5).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
+				ui.Text(c, "API Key").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+				ui.Text(c, "留空则自动读取环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY").FontSize(FontCaption).TextColor(p.TextMuted)
+			})
 			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-				in := ui.TextInput(c, &prof.APIKey).Grow(1).Font("Menlo").Placeholder("sk-...")
+				in := ui.TextInput(c, &prof.APIKey).Grow(1).Font(FontMono).Placeholder("sk-...")
 				if !s.ShowAPIKey {
 					in.Password()
 				}
@@ -473,12 +427,12 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 			})
 		})
 
-		// Models Management Box (.models-box)
-		ui.Column(c).FillWidth().Padding(10, 12).Radius(9).
+		// Models Management Card
+		ui.Column(c).FillWidth().Padding(10, 12).Radius(RadiusMD).
 			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(8).Children(func() {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(5).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
 				ui.Text(c, fmt.Sprintf("启用模型 (%d/%d)", len(prof.AvailableModels()), len(candidates))).
-					Bold().FontSize(11.5).TextColor(p.TextSecondary)
+					FontWeight(WeightMedium).FontSize(FontSmall).FontFeatures("tnum").TextColor(p.TextPrimary)
 				ui.Spacer(c)
 
 				if len(candidates) > 0 {
@@ -490,7 +444,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 							}
 						}
 					})
-					IconTipBtn(c, p, IconFilter, 26, 13.5, "仅保留当前选中的模型", func() {
+					IconTipBtn(c, p, IconFilter, 26, 13.5, "仅保留当前默认模型", func() {
 						cur := strings.TrimSpace(prof.ModelID)
 						if cur != "" {
 							prof.Models = []string{cur}
@@ -500,19 +454,21 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 					})
 				}
 
-				fb := ui.ButtonBase(c).Size(26, 26).Radius(6).Border(1, p.BorderStrong).
+				fb := ui.ButtonBase(c).Height(26).Padding(0, 9).Radius(RadiusSM).
+					Border(1, p.BorderSubtle).Gap(5).
 					AlignItems(ui.Center).Justify(ui.Center).Disabled(s.fetchingModels).
 					Tooltip("从 /v1/models 拉取模型列表").Label("从 /v1/models 拉取模型列表")
-				fBg := p.BgElevated
+				fBg := p.InputBg
 				if fb.Hovered() && !s.fetchingModels {
 					fBg = p.BgHover
 				}
 				fb.Background(fBg).Children(func() {
 					if s.fetchingModels {
-						ui.Spinner(c).Size(12, 12)
+						ui.Spinner(c).Size(11.5, 11.5)
 					} else {
-						ui.Icon(c, IconRefresh).Size(13, 13).TextColor(p.Accent)
+						ui.Icon(c, IconRefresh).Size(12, 12).TextColor(p.Accent)
 					}
+					ui.Text(c, "拉取模型").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.TextSecondary)
 				})
 				if fb.Clicked() {
 					s.triggerFetchModels(*prof, updateUI)
@@ -521,28 +477,28 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 
 			// Active Model ID input + Search Filter
 			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.TextInput(c, &prof.ModelID).Grow(1).Font("Menlo").Placeholder("当前模型 ID (如 gpt-4.1 / deepseek-v3)")
+				ui.TextInput(c, &prof.ModelID).Grow(1).Font(FontMono).Placeholder("当前默认模型 ID (如 claude-sonnet-4-5 / gpt-4.1)")
 				if trimmed := strings.TrimSpace(prof.ModelID); trimmed != "" && !prof.HasModel(trimmed) {
-					ToolbarIconBtn(c, p, IconPlus, 28, 14, false, p.LocalColor, "加入候选模型列表", func() {
+					ToolbarIconBtn(c, p, IconPlus, 28, 14, false, p.Accent, "加入候选模型列表", func() {
 						prof.AddModel(trimmed)
 					})
 				}
 				if len(candidates) > 3 {
-					ui.TextInput(c, &s.modelSearch).Width(155).Placeholder("搜索过滤模型...")
+					ui.TextInput(c, &s.modelSearch).Width(160).Placeholder("过滤模型...")
 				}
 			})
 
 			if s.fetchError != "" {
-				ui.Text(c, s.fetchError).Font("Menlo").FontSize(11).TextColor(p.DangerColor)
+				ui.Text(c, s.fetchError).FontSize(FontCaption).TextColor(p.DangerColor)
 			} else if s.fetchStatus != "" {
-				ui.Text(c, s.fetchStatus).Font("Menlo").FontSize(11).TextColor(p.LocalColor)
+				ui.Text(c, s.fetchStatus).FontSize(FontCaption).TextColor(p.LocalColor)
 			}
 
-			// Model Checklist (.model-row)
+			// Model Checklist — Unified AppCheckbox + Star/Default Badge (no Bolt collision!)
 			if len(candidates) > 0 {
 				q := strings.ToLower(strings.TrimSpace(s.modelSearch))
-				ui.Scroll(c).MaxHeight(125).FillWidth().Children(func() {
-					ui.Column(c).FillWidth().Gap(3).Children(func() {
+				ui.Scroll(c).MaxHeight(130).FillWidth().Children(func() {
+					ui.Column(c).FillWidth().Gap(2).Children(func() {
 						shownCount := 0
 						for _, cand := range candidates {
 							modelName := cand
@@ -557,46 +513,29 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 							if isCurrent {
 								rowBg = p.BgHover
 							}
-							ui.Row(c).FillWidth().Padding(5, 8).Radius(6).Background(rowBg).
+							ui.Row(c).FillWidth().Height(30).Padding(0, 8).Radius(RadiusSM).Background(rowBg).
 								AlignItems(ui.Center).Gap(8).Children(func() {
-								// Custom Emerald Checkbox + Model ID
-								cb := ui.ButtonBase(c).Gap(8).AlignItems(ui.Center)
-								boxBg := ui.Transparent
-								boxBorder := p.BorderStrong
-								if checked {
-									boxBg = p.LocalColor
-									boxBorder = p.LocalColor
-								}
-								cb.Children(func() {
-									ui.Row(c).Size(14, 14).Radius(4).Background(boxBg).Border(1, boxBorder).
-										AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-										if checked {
-											ui.Icon(c, IconCheck).Size(10, 10).TextColor(p.BtnPrimaryFg)
-										}
-									})
-									el := ui.Text(c, modelName).Font("Menlo").FontSize(12).TextColor(p.TextPrimary)
-									if isCurrent {
-										el.Bold()
-									}
-								})
-								if cb.Clicked() {
-									if checked {
-										prof.RemoveModel(modelName)
-									} else {
+								toggled := checked
+								AppCheckbox(c, p, &toggled, modelName, true)
+								if toggled != checked {
+									if toggled {
 										prof.AddModel(modelName)
+									} else {
+										prof.RemoveModel(modelName)
 									}
 								}
 
 								ui.Spacer(c)
 
 								if isCurrent {
-									ui.Row(c).Size(22, 22).Radius(6).Background(p.AccentSoft).
-										AlignItems(ui.Center).Justify(ui.Center).
+									ui.Row(c).Padding(2, 7).Radius(RadiusSM).Background(p.AccentSoft).
+										AlignItems(ui.Center).Gap(4).
 										Tooltip("当前默认使用模型").Children(func() {
-										ui.Icon(c, IconBolt).Size(12, 12).TextColor(p.Accent)
+										ui.Icon(c, IconStar).Size(10.5, 10.5).TextColor(p.Accent)
+										ui.Text(c, "默认").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.Accent)
 									})
 								} else {
-									IconTipBtn(c, p, IconBolt, 22, 12, "设为当前默认模型", func() {
+									IconTipBtn(c, p, IconStar, 24, 12.5, "设为当前默认模型", func() {
 										prof.ModelID = modelName
 										prof.AddModel(modelName)
 									})
@@ -604,7 +543,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 							})
 						}
 						if shownCount == 0 {
-							ui.Text(c, "没有匹配的模型").FontSize(11).TextColor(p.TextMuted)
+							ui.Text(c, "没有匹配的模型").FontSize(FontCaption).TextColor(p.TextMuted).Padding(4, 8)
 						}
 					})
 				})
@@ -612,10 +551,10 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 		})
 
 		// Thinking Level 4-way segmented bar
-		ui.Column(c).FillWidth().Gap(4).Children(func() {
-			ui.Text(c, "推理思考深度 (Thinking Level)").FontSize(11.5).TextColor(p.TextSecondary)
+		ui.Column(c).FillWidth().Gap(5).Children(func() {
+			ui.Text(c, "默认推理思考深度").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
 			prevThink := thinkIdx
-			renderSegmentedBar(c, p, &thinkIdx, thinkingLabels)
+			SegmentedBar(c, p, &thinkIdx, thinkingLabels)
 			if thinkIdx != prevThink {
 				prof.ThinkingLevel = thinkingValues[thinkIdx]
 			}
@@ -624,85 +563,76 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 }
 
 func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.AppConfig, liveCfg *store.AppConfig, onApply func() error) {
-	ui.Column(c).FillWidth().Gap(10).Children(func() {
-		ui.Text(c, "已配置的工作区目标 (支持在同一 Session 对话中随时一键热切换):").
-			Bold().FontSize(12).TextColor(p.TextSecondary)
+	ui.Column(c).FillWidth().Gap(12).Children(func() {
+		ui.Text(c, "已配置的工作区目标（支持在同一会话中随时一键热切换）：").
+			FontSize(FontSmall).TextColor(p.TextSecondary)
 
-		ui.Scroll(c).MaxHeight(175).FillWidth().Children(func() {
-			ui.Column(c).FillWidth().Gap(6).Children(func() {
-				for i := range draft.Targets {
-					wt := &draft.Targets[i]
-					icon := IconFolder
-					iconBg := p.LocalSoft
-					iconFg := p.LocalColor
-					tagText := "Local"
-					if wt.IsRemote {
-						icon = IconServer
-						iconBg = p.SSHSoft
-						iconFg = p.SSHColor
-						tagText = "SSH"
-					}
-					ui.Row(c).FillWidth().Padding(7, 10).Radius(8).
-						Background(p.BgSurface).Border(1, p.BorderSubtle).
-						AlignItems(ui.Center).Gap(9).Children(func() {
-						ui.Row(c).Size(24, 24).Radius(6).Background(iconBg).
-							AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-							ui.Icon(c, icon).Size(13, 13).TextColor(iconFg)
-						})
-						ui.Column(c).Grow(1).Gap(1).Children(func() {
-							ui.Text(c, wt.ShortName()).Bold().FontSize(12.5).TextColor(p.TextPrimary)
-							ui.Text(c, wt.DisplaySub()).Font("Menlo").FontSize(11).TextColor(p.TextMuted).SingleLine().Ellipsis("...")
-						})
-						ui.Row(c).Padding(1, 7).Radius(99).Background(iconBg).Children(func() {
-							ui.Text(c, tagText).Bold().Font("Menlo").FontSize(10).TextColor(iconFg)
-						})
-						if len(draft.Targets) > 1 && i > 0 {
-							idx := i
-							DangerIconBtn(c, p, IconTrash, 26, 13.5, "移除该工作区目标", func() {
-								removedID := draft.Targets[idx].ID
-								draft.Targets = append(draft.Targets[:idx], draft.Targets[idx+1:]...)
-								if draft.ActiveTargetID == removedID {
-									_ = draft.ActiveTarget()
-								}
-							})
-						}
-					})
+		ui.Column(c).FillWidth().Gap(5).Children(func() {
+			for i := range draft.Targets {
+				wt := &draft.Targets[i]
+				icon := IconFolder
+				iconBg := p.InputBg
+				iconFg := p.TextSecondary
+				if wt.IsRemote {
+					icon = IconServer
+					iconBg = p.SSHSoft
+					iconFg = p.SSHColor
 				}
-			})
+				ui.Row(c).FillWidth().Padding(8, 10).Radius(RadiusMD).
+					Background(p.BgSurface).Border(1, p.BorderSubtle).
+					AlignItems(ui.Center).Gap(10).Children(func() {
+					ui.Row(c).Size(28, 28).Shrink(0).Radius(RadiusSM).Background(iconBg).
+						AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+						ui.Icon(c, icon).Size(14, 14).TextColor(iconFg)
+					})
+					ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
+						ui.Text(c, wt.ShortName()).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).SingleLine().Ellipsis("...")
+						ui.Text(c, wt.DisplaySub()).Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted).SingleLine().Ellipsis("...")
+					})
+					if wt.IsRemote {
+						ui.Row(c).Padding(2, 7).Radius(RadiusSM).Background(p.SSHSoft).Shrink(0).Children(func() {
+							ui.Text(c, "SSH").Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
+						})
+					} else {
+						ui.Text(c, "本地").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
+					}
+					if len(draft.Targets) > 1 && i > 0 {
+						idx := i
+						DangerIconBtn(c, p, IconTrash, 26, 13.5, "移除该工作区目标", func() {
+							removedID := draft.Targets[idx].ID
+							draft.Targets = append(draft.Targets[:idx], draft.Targets[idx+1:]...)
+							if draft.ActiveTargetID == removedID {
+								_ = draft.ActiveTarget()
+							}
+						})
+					}
+				})
+			}
 		})
 
-		ui.Column(c).FillWidth().Padding(10, 12).Radius(9).
-			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(8).Children(func() {
+		// Add New Workspace Target Card
+		ui.Column(c).FillWidth().Padding(12, 14).Radius(RadiusMD).
+			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(10).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "添加新工作区目标").Bold().FontSize(12).TextColor(p.TextPrimary)
+				ui.Text(c, "添加新工作区目标").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary)
 				ui.Spacer(c)
-				ui.Checkbox(c, &s.NewTargetRemote, "远程 SSH 服务器 (复用 ~/.ssh/config 与 ControlMaster)")
+				AppCheckbox(c, p, &s.NewTargetRemote, "远程 SSH 服务器 (复用 ~/.ssh/config)", false)
 			})
 
 			ui.Row(c).FillWidth().Gap(8).Children(func() {
-				ui.TextInput(c, &s.NewTargetName).Grow(1).Placeholder("显示名称 (如: prod-gateway / frontend)")
+				ui.TextInput(c, &s.NewTargetName).Grow(1).Placeholder("显示名称 (可选，如 prod-gateway)")
 				if s.NewTargetRemote {
-					ui.TextInput(c, &s.NewTargetSSHHost).Grow(1).Font("Menlo").Placeholder("SSH Host 别名或 user@ip")
+					ui.TextInput(c, &s.NewTargetSSHHost).Grow(1).Font(FontMono).Placeholder("SSH Host 别名或 user@ip")
 				}
 			})
 
 			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-				dirHint := "本地绝对路径 (如 ~/Documents/code/myproj)"
+				dirHint := "本地目录路径 (如 ~/Documents/code/myproj)"
 				if s.NewTargetRemote {
 					dirHint = "远端工作目录 (如 /srv/gateway 或 ~)"
 				}
-				ui.TextInput(c, &s.NewTargetWorkDir).Grow(1).Font("Menlo").Placeholder(dirHint)
-				addTargetBtn := ui.ButtonBase(c).Size(30, 30).Radius(7).
-					AlignItems(ui.Center).Justify(ui.Center).
-					Tooltip("添加工作区目标").Label("添加工作区目标")
-				addBg := p.BtnPrimaryBg
-				if addTargetBtn.Hovered() {
-					addBg = addBg.Alpha(0.9)
-				}
-				addTargetBtn.Background(addBg).Children(func() {
-					ui.Icon(c, IconPlus).Size(15, 15).TextColor(p.BtnPrimaryFg)
-				})
-				if addTargetBtn.Clicked() {
+				ui.TextInput(c, &s.NewTargetWorkDir).Grow(1).Font(FontMono).Placeholder(dirHint)
+				PrimaryBtn(c, p, IconPlus, "添加", "添加工作区目标", func() {
 					workDir := strings.TrimSpace(s.NewTargetWorkDir)
 					sshHost := strings.TrimSpace(s.NewTargetSSHHost)
 					name := strings.TrimSpace(s.NewTargetName)
@@ -742,10 +672,11 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 								c.Toast(s.saveError)
 							} else {
 								s.saveError = ""
+								c.Toast("已添加工作区: " + name)
 							}
 						}
 					}
-				}
+				})
 			})
 		})
 	})
@@ -760,35 +691,43 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 		}
 	}
 
-	ui.Column(c).FillWidth().Gap(10).Children(func() {
-		ui.Column(c).FillWidth().Gap(4).Children(func() {
-			ui.Text(c, "高危操作弹窗拦截策略 (Human-in-the-Loop Safety Gate)").FontSize(11.5).TextColor(p.TextSecondary)
+	ui.Column(c).FillWidth().Gap(12).Children(func() {
+		ui.Column(c).FillWidth().Gap(6).Children(func() {
+			ui.Text(c, "高危操作弹窗拦截策略 (Human-in-the-Loop Safety Gate)").
+				FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
 			prevPol := policyIdx
-			renderSegmentedBar(c, p, &policyIdx, safetyLabels)
+			SegmentedBar(c, p, &policyIdx, safetyLabels)
 			if policyIdx != prevPol {
 				draft.SafetyPolicy = safetyValues[policyIdx]
 			}
 		})
 
-		policyDesc := "【远程高危拦截 (推荐)】：在远程 SSH 服务器上拦截 rm -rf、systemctl 关停、kill -9、防火墙/数据库破坏操作以及 /etc、~/.ssh、.env 等敏感文件修改；在本地环境仅拦截 rm -rf /、mkfs、shutdown 等毁灭性命令。"
+		policyDesc := "远程高危拦截（推荐）：在远程 SSH 服务器上拦截 rm -rf、systemctl 关停、kill -9、防火墙/数据库破坏操作以及 /etc、~/.ssh、.env 等敏感文件修改；在本地环境仅拦截 rm -rf /、mkfs、shutdown 等毁灭性命令。"
+		accentCol := p.LocalColor
 		switch draft.SafetyPolicy {
 		case store.SafetyPolicyAlwaysHighRisk:
-			policyDesc = "【全局高危拦截】：无论在本地目录还是远程 SSH 服务器，遇到高危 bash 命令与敏感配置文件修改均弹窗要求人工确认。"
+			policyDesc = "全局高危拦截：无论在本地目录还是远程 SSH 服务器，遇到高危 bash 命令与敏感配置文件修改均弹窗要求人工确认。"
+			accentCol = p.Accent
 		case store.SafetyPolicyStrictRemote:
-			policyDesc = "【远程严格模式】：在远程 SSH 服务器上，除 ls/cat/grep/git status 等纯只读查询命令外，所有文件写入/修改 (write/edit) 与变更命令均需弹窗审批。"
+			policyDesc = "远程严格模式：在远程 SSH 服务器上，除 ls/cat/grep/git status 等纯只读查询命令外，所有文件写入/修改 (write/edit) 与变更命令均需弹窗审批。"
+			accentCol = p.SSHColor
 		case store.SafetyPolicyOff:
-			policyDesc = "【关闭拦截】：所有工具调用均自动放行，不弹出安全确认框（请谨慎在生产服务器开启）。"
+			policyDesc = "关闭拦截：所有工具调用均自动放行，不弹出安全确认框（请谨慎在生产服务器开启）。"
+			accentCol = p.WarnColor
 		}
-		ui.Column(c).FillWidth().Padding(8, 12).Radius(8).
-			Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-			ui.Text(c, policyDesc).FontSize(11.5).TextColor(p.TextSecondary)
+		ui.Row(c).FillWidth().Radius(RadiusMD).
+			Background(p.BgSurface).Border(1, p.BorderSubtle).Clip().Children(func() {
+			ui.Box(c).Width(3).FillHeight().Shrink(0).Background(accentCol)
+			ui.Column(c).Grow(1).MinWidth(0).Padding(10, 14).Children(func() {
+				ui.Text(c, policyDesc).FontSize(FontSmall).LineHeight(1.55).TextColor(p.TextSecondary)
+			})
 		})
 
 		if mgr != nil && mgr.SafetyGate() != nil {
 			trustedCount := mgr.SafetyGate().TrustedCount()
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
-				ui.Text(c, fmt.Sprintf("当前会话已记住免审的操作签名数: %d", trustedCount)).
-					FontSize(12).TextColor(p.TextSecondary)
+				ui.Text(c, fmt.Sprintf("当前会话已记住免审的操作签名数：%d", trustedCount)).
+					FontSize(FontSmall).FontFeatures("tnum").TextColor(p.TextSecondary)
 				ui.Spacer(c)
 				if trustedCount > 0 {
 					DangerIconBtn(c, p, IconTrash, 26, 13.5, "清空本会话免审白名单", func() {
@@ -800,48 +739,42 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 		}
 
 		// Active Skills discovery display (Local + Remote SSH)
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Padding(4, 0, 0, 0).Children(func() {
-			ui.Text(c, fmt.Sprintf("已自动发现的 Skills (%d)", len(skills))).Bold().FontSize(12.5).TextColor(p.TextPrimary)
-			ui.Spacer(c)
-			ui.Text(c, "扫描路径: <工作区>/.pi/skills & ~/.pi/agent/skills").Font("Menlo").FontSize(10.5).TextColor(p.TextMuted)
-		})
+		ui.Column(c).FillWidth().Gap(6).Padding(4, 0, 0, 0).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Text(c, fmt.Sprintf("已自动发现的 Skills (%d)", len(skills))).
+					FontWeight(WeightMedium).FontSize(FontSmall).FontFeatures("tnum").TextColor(p.TextPrimary)
+				ui.Spacer(c)
+				ui.Text(c, ".pi/skills · ~/.pi/agent/skills").Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted)
+			})
 
-		ui.Scroll(c).MaxHeight(150).FillWidth().Children(func() {
-			ui.Column(c).FillWidth().Gap(6).Children(func() {
-				if len(skills) == 0 {
-					ui.Column(c).FillWidth().Padding(10, 12).Radius(8).
-						Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-						ui.Text(c, "当前工作区未发现自定义 SKILL.md，可在项目 .pi/skills/<name>/SKILL.md 中添加专属技能。").
-							FontSize(11.5).TextColor(p.TextMuted)
-					})
-				}
+			if len(skills) == 0 {
+				ui.Column(c).FillWidth().Padding(12, 14).Radius(RadiusMD).
+					Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
+					ui.Text(c, "当前工作区未发现自定义 SKILL.md，可在项目 .pi/skills/<name>/SKILL.md 中添加专属技能。").
+						FontSize(FontSmall).LineHeight(1.5).TextColor(p.TextMuted)
+				})
+			} else {
 				for _, sk := range skills {
 					isRemoteSkill := strings.HasPrefix(sk.FilePath, "ssh://")
-					badgeBg := p.LocalSoft
-					badgeFg := p.LocalColor
-					badgeText := "SKILL"
-					if isRemoteSkill {
-						badgeBg = p.SSHSoft
-						badgeFg = p.SSHColor
-						badgeText = "SSH SKILL"
-					}
-					ui.Column(c).FillWidth().Padding(7, 10).Radius(8).
-						Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(3).Children(func() {
+					ui.Column(c).FillWidth().Padding(8, 12).Radius(RadiusMD).
+						Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(4).Children(func() {
 						ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-							ui.Row(c).Padding(1, 6).Radius(4).Background(badgeBg).Children(func() {
-								ui.Text(c, badgeText).Bold().Font("Menlo").FontSize(10).TextColor(badgeFg)
-							})
-							ui.Text(c, sk.Name).Bold().FontSize(12).TextColor(p.TextPrimary)
+							if isRemoteSkill {
+								ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Children(func() {
+									ui.Text(c, "SSH").Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
+								})
+							}
+							ui.Text(c, sk.Name).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary)
 							ui.Spacer(c)
 							ui.Text(c, filepath.Base(filepath.Dir(sk.FilePath))+"/"+filepath.Base(sk.FilePath)).
-								Font("Menlo").FontSize(10.5).TextColor(p.TextMuted)
+								Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted)
 						})
 						if sk.Description != "" {
-							ui.Text(c, sk.Description).FontSize(11).TextColor(p.TextSecondary).SingleLine().Ellipsis("...")
+							ui.Text(c, sk.Description).FontSize(FontCaption + 0.5).LineHeight(1.45).TextColor(p.TextSecondary).SingleLine().Ellipsis("...")
 						}
 					})
 				}
-			})
+			}
 		})
 	})
 }

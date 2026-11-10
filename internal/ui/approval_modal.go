@@ -69,7 +69,7 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 	}
 
 	open := true
-	ui.Modal(c, &open, func() {
+	AppDialog(c, p, &open, 540, 0, func() {
 		levelLabel := "高危操作拦截"
 		bannerBg := p.DangerSoft
 		bannerFg := p.DangerColor
@@ -82,84 +82,87 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 			bannerFg = p.WarnColor
 		}
 
-		targetChipText := "Local · " + req.Target.DisplaySub()
-		targetChipBg := p.LocalSoft
-		targetChipFg := p.LocalColor
-		if req.Target.IsRemote {
-			targetChipText = "SSH · " + req.Target.DisplaySub()
-			targetChipBg = p.SSHSoft
-			targetChipFg = p.SSHColor
-		}
-
-		ui.Column(c).Width(540).Gap(11).Children(func() {
-			// Danger Banner (.danger-banner)
-			ui.Row(c).FillWidth().Padding(10, 12).Radius(9).
-				Background(bannerBg).Border(1, bannerFg).
-				AlignItems(ui.Center).Gap(10).Children(func() {
-				ui.Row(c).Padding(2, 8).Radius(5).Background(bannerBg).Gap(5).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, IconShieldAlert).Size(13, 13).TextColor(bannerFg)
-					ui.Text(c, levelLabel).Bold().FontSize(11).TextColor(bannerFg)
+		ui.Column(c).FillWidth().Children(func() {
+			// Clean Edge-to-Edge Risk Header (zero nested double-boxes)
+			ui.Row(c).FillWidth().Padding(14, 18).Gap(10).AlignItems(ui.Center).
+				Background(bannerBg).BorderWidth(0, 0, 1, 0).BorderColor(bannerFg.Alpha(0.28)).
+				Children(func() {
+					ui.Row(c).Size(30, 30).Shrink(0).Radius(RadiusMD).Background(bannerFg.Alpha(0.16)).
+						AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+						ui.Icon(c, IconShieldAlert).Size(16, 16).TextColor(bannerFg)
+					})
+					ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
+						ui.Text(c, levelLabel+" · "+req.Assessment.Category).
+							FontWeight(WeightSemibold).FontSize(FontBody).TextColor(p.TextPrimary).SingleLine().Ellipsis("...")
+						ui.Text(c, req.Assessment.Reason).
+							FontSize(FontCaption + 0.5).TextColor(p.TextSecondary).SingleLine().Ellipsis("...")
+					})
+					if len(m.Queue) > 1 {
+						ui.Row(c).Padding(2, 7).Radius(RadiusPill).Background(p.ModalBg).Border(1, p.BorderSubtle).Children(func() {
+							ui.Text(c, fmt.Sprintf("1/%d", len(m.Queue))).
+								FontFeatures("tnum").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+						})
+					}
 				})
-				ui.Text(c, req.Assessment.Category).Bold().FontSize(13.5).TextColor(p.TextPrimary)
-				ui.Spacer(c)
-				ui.Text(c, fmt.Sprintf("待审队列: %d", len(m.Queue))).
-					Font("Menlo").FontSize(11).TextColor(p.TextMuted)
-			})
 
-			// Metadata Chips (.meta-row)
-			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
-				ui.Row(c).Padding(3, 8).Radius(5).Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
-					ui.Text(c, "工具: "+req.ToolName).Font("Menlo").FontSize(11).TextColor(p.TextSecondary)
-				})
-				ui.Row(c).Padding(3, 8).Radius(5).Background(targetChipBg).Children(func() {
-					ui.Text(c, targetChipText).Bold().Font("Menlo").FontSize(11).TextColor(targetChipFg)
-				})
-				ui.Row(c).Padding(3, 8).Radius(5).Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
-					ui.Text(c, "策略: Safety Gate").Font("Menlo").FontSize(11).TextColor(p.TextSecondary)
-				})
-			})
+			// Body Section
+			ui.Column(c).FillWidth().Padding(16, 18).Gap(12).Children(func() {
+				// Context Metadata Row
+				ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
+					ui.Row(c).Padding(3, 8).Radius(RadiusSM).Background(p.InputBg).Border(1, p.BorderSubtle).Gap(5).AlignItems(ui.Center).Children(func() {
+						toolIcon, _ := toolVisualMeta(req.ToolName)
+						ui.Icon(c, toolIcon).Size(11.5, 11.5).TextColor(p.TextMuted)
+						ui.Text(c, req.ToolName).Font(FontMono).FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.TextPrimary)
+					})
 
-			// Interception Reason
-			ui.Row(c).FillWidth().Gap(4).Wrap().Children(func() {
-				ui.Text(c, "拦截原因：").Bold().FontSize(12.5).TextColor(p.TextPrimary)
-				ui.Text(c, req.Assessment.Reason).FontSize(12.5).TextColor(p.TextSecondary)
-			})
+					if req.Target.IsRemote {
+						ui.Row(c).Padding(3, 8).Radius(RadiusSM).Background(p.SSHSoft).Gap(5).AlignItems(ui.Center).Children(func() {
+							ui.Icon(c, IconServer).Size(11.5, 11.5).TextColor(p.SSHColor)
+							ui.Text(c, "SSH · "+req.Target.DisplaySub()).Font(FontMono).FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.SSHColor)
+						})
+					} else {
+						ui.Row(c).Padding(3, 8).Radius(RadiusSM).Background(p.InputBg).Border(1, p.BorderSubtle).Gap(5).AlignItems(ui.Center).Children(func() {
+							ui.Icon(c, IconFolder).Size(11.5, 11.5).TextColor(p.TextMuted)
+							ui.Text(c, req.Target.DisplaySub()).Font(FontMono).FontSize(FontCaption).TextColor(p.TextSecondary)
+						})
+					}
+				})
 
-			// Command / File Diff Preview Box (.cmd-preview-box)
-			ui.Column(c).FillWidth().Gap(4).Children(func() {
-				ui.Text(c, "待执行内容详情:").FontSize(11.5).TextColor(p.TextSecondary)
-				ui.Scroll(c).MaxHeight(160).FillWidth().Children(func() {
-					ui.Column(c).FillWidth().Padding(10, 12).Radius(8).
-						Background(p.CodeBg).Border(1, p.BorderSubtle).Gap(4).Children(func() {
-						ui.Text(c, "# Target: "+req.Target.DisplaySub()).
-							Font("Menlo").FontSize(11).TextColor(p.TextMuted)
-						ui.Text(c, req.Assessment.Preview).
-							Font("Menlo").FontSize(11.5).TextColor(p.TermText).Selectable()
+				// Command / File Diff Preview Box
+				ui.Column(c).FillWidth().Gap(5).Children(func() {
+					ui.Text(c, "待执行指令或变更预览").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+					ui.Scroll(c).MaxHeight(160).FillWidth().Children(func() {
+						ui.Column(c).FillWidth().Padding(10, 12).Radius(RadiusMD).
+							Background(p.CodeBg).Border(1, p.BorderSubtle).Gap(4).Children(func() {
+							ui.Text(c, req.Assessment.Preview).
+								Font(FontMono).FontSize(FontSmall).LineHeight(1.48).TextColor(p.TermText).Selectable()
+						})
 					})
 				})
+
+				// Optional rejection / steering instruction
+				ui.Column(c).FillWidth().Gap(5).Children(func() {
+					ui.Text(c, "拒绝或纠偏指示（可选，拒绝时将作为 Steer 反馈注入上下文）").
+						FontSize(FontSmall).TextColor(p.TextSecondary)
+					ui.TextInput(c, &m.FeedbackInput).FillWidth().
+						Placeholder("例如：不要直接 reload 生产网关，请先执行 nginx -t 校验语法...")
+				})
 			})
 
-			// Optional rejection / steering instruction
-			ui.Column(c).FillWidth().Gap(4).Children(func() {
-				ui.Text(c, "拒绝或纠偏指示 (可选，拒绝时将直接作为 Steer 反馈注入 Agent 上下文)").
-					FontSize(11.5).TextColor(p.TextSecondary)
-				ui.TextInput(c, &m.FeedbackInput).FillWidth().
-					Placeholder("例如：不要直接 reload 生产网关，请先执行 nginx -t 校验语法...")
-			})
-
-			// Action Footer (.modal-footer)
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).
-				Padding(10, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
+			// Edge-to-Edge Action Footer
+			ui.Row(c).FillWidth().Height(52).Padding(0, 18).AlignItems(ui.Center).Gap(8).
+				Background(p.BgSidebar).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
 				// Deny Button
-				denyBtn := ui.ButtonBase(c).Padding(6, 12).Radius(7).Border(1, p.DangerColor).Gap(5).
+				denyBtn := ui.ButtonBase(c).Height(30).Padding(0, 12).Radius(RadiusSM).
+					Border(1, p.DangerColor.Alpha(0.45)).Gap(5).
 					AlignItems(ui.Center).Tooltip("拒绝执行并将上方纠偏指示反馈给 Agent")
 				denyBg := p.DangerSoft
-				if denyBtn.Hovered() {
+				if denyBtn.Hovered() || denyBtn.Pressed() {
 					denyBg = p.DangerColor.Alpha(0.22)
 				}
 				denyBtn.Background(denyBg).Children(func() {
 					ui.Icon(c, IconCross).Size(13, 13).TextColor(p.DangerColor)
-					ui.Text(c, "拒绝").Bold().FontSize(12).TextColor(p.DangerColor)
+					ui.Text(c, "拒绝").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.DangerColor)
 				})
 				if denyBtn.Clicked() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{
@@ -173,37 +176,25 @@ func (m *ApprovalModal) Render(c *ui.Context, p Palette, gate *harness.SafetyGat
 				ui.Spacer(c)
 
 				// Trust in Session Button
-				trustBtn := ui.ButtonBase(c).Padding(6, 12).Radius(7).Border(1, p.BorderStrong).Gap(5).
-					AlignItems(ui.Center).Tooltip("允许本次执行，并在本会话内自动放行同类签名操作")
-				trustBg := ui.Transparent
-				trustFg := p.TextSecondary
-				if trustBtn.Hovered() || trustBtn.Pressed() {
-					trustBg = p.BgHover
-					trustFg = p.TextPrimary
-				}
-				trustBtn.Background(trustBg).Children(func() {
-					ui.Icon(c, IconShieldCheck).Size(13.5, 13.5).TextColor(trustFg)
-					ui.Text(c, "本会话免审").FontSize(12).TextColor(trustFg)
-				})
-				if trustBtn.Clicked() {
+				GhostBtn(c, p, IconShieldCheck, "本会话免审", "允许本次执行，并在本会话内自动放行同类签名操作", func() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{
 						Approved:       true,
 						TrustSignature: true,
 					})
 					m.Pop()
 					c.Toast("已放行并在当前会话内信任同类操作")
-				}
+				})
 
-				// Allow Button
-				allowBtn := ui.ButtonBase(c).Padding(6, 14).Radius(7).Gap(5).
+				// Allow Button (100% Palette-driven)
+				allowBtn := ui.ButtonBase(c).Height(30).Padding(0, 14).Radius(RadiusSM).Gap(5).
 					AlignItems(ui.Center).Tooltip("批准本次操作执行")
-				allowBg := ui.Hex("#10B981")
-				if allowBtn.Hovered() {
-					allowBg = ui.Hex("#34D399")
+				allowBg := p.SuccessBg
+				if allowBtn.Hovered() || allowBtn.Pressed() {
+					allowBg = allowBg.Alpha(0.88)
 				}
 				allowBtn.Background(allowBg).Children(func() {
-					ui.Icon(c, IconCheck).Size(13.5, 13.5).TextColor(ui.Hex("#052E16"))
-					ui.Text(c, "允许").Bold().FontSize(12).TextColor(ui.Hex("#052E16"))
+					ui.Icon(c, IconCheck).Size(13.5, 13.5).TextColor(p.SuccessFg)
+					ui.Text(c, "允许执行").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.SuccessFg)
 				})
 				if allowBtn.Clicked() {
 					gate.Resolve(req.ID, harness.ApprovalDecision{

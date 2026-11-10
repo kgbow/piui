@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/egoist/mygo/ui/markdown"
@@ -58,6 +59,28 @@ func (e *ChatEntry) IsEmpty() bool {
 		strings.TrimSpace(e.ErrorText) == ""
 }
 
+// EntryTopSpacing computes context-aware vertical rhythm between consecutive timeline entries:
+// generous breathing room between conversation turns, tight cohesion between consecutive tool steps.
+func EntryTopSpacing(prevKind, curKind EntryKind, isFirst bool) float32 {
+	if isFirst {
+		return 0
+	}
+	switch {
+	case curKind == EntryUser:
+		return 16
+	case prevKind == EntryUser:
+		return 10
+	case prevKind == EntryTool && curKind == EntryTool:
+		return 6
+	case prevKind == EntryAssistant && curKind == EntryTool:
+		return 10
+	case prevKind == EntryTool && curKind == EntryAssistant:
+		return 14
+	default:
+		return 14
+	}
+}
+
 // SyncAssistantEntryFromMessage populates final text, thinking, and error message fields
 // from a completed ai.AssistantMessage if they were not already populated via streaming deltas.
 func SyncAssistantEntryFromMessage(entry *ChatEntry, msg agent.AgentMessage) {
@@ -106,86 +129,140 @@ func RenderChatEntry(c *ui.Context, entry *ChatEntry, mdOpts *markdown.Options) 
 	RenderChatEntryWithActions(c, PaletteFor(!c.Theme().Dark), entry, mdOpts, false, nil)
 }
 
+func toolVisualMeta(toolName string) (*ui.SVG, string) {
+	switch toolName {
+	case "bash":
+		return IconTerminal, "bash"
+	case "read":
+		return IconFileText, "read"
+	case "edit":
+		return IconFileEdit, "edit"
+	case "write":
+		return IconFileEdit, "write"
+	case "grep", "find":
+		return IconSearch, toolName
+	case "ls":
+		return IconFolder, "ls"
+	case "workspace_probe":
+		return IconCompass, "probe"
+	default:
+		return IconCode, toolName
+	}
+}
+
 // RenderChatEntryWithActions renders a single ChatEntry in the Antigravity quiet stream style.
 func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *markdown.Options, canFork bool, onFork func(*ChatEntry)) {
+	RenderChatTurnEntry(c, p, entry, mdOpts, canFork, true, onFork)
+}
+
+// RenderChatTurnEntry renders a single ChatEntry with optional suppression of the assistant turn-end footer
+// when the entry is an intermediate intro step directly preceding tool execution cards.
+func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *markdown.Options, canFork bool, showTurnFooter bool, onFork func(*ChatEntry)) {
 	isRemote := entry.IsRemote || strings.Contains(entry.TargetBadge, "SSH") || strings.Contains(entry.TargetBadge, "🌐")
 
 	switch entry.Kind {
 	case EntryUser:
-		ui.Column(c).FillWidth().MinWidth(0).AlignItems(ui.End).Gap(5).Children(func() {
-			// Clean prompt bubble (ONLY prompt text inside)
-			ui.Column(c).MaxWidth(580).MinWidth(0).Padding(10, 14).Radius(14).
+		turnWrap := ui.Column(c).FillWidth().MinWidth(0).AlignItems(ui.End).Gap(4)
+		showActions := turnWrap.Hovered() || turnWrap.FocusWithin()
+		targetOp := float32(0.0)
+		if showActions {
+			targetOp = 1.0
+		}
+		actionOp := turnWrap.Animate("u-act", targetOp, 140*time.Millisecond)
+
+		turnWrap.Children(func() {
+			// Asymmetric refined prompt bubble
+			ui.Column(c).MaxWidth(580).MinWidth(0).Padding(10, 14).
+				Radius(RadiusLG, RadiusLG, 4, RadiusLG).
 				Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
-				ui.Text(c, entry.Text).FontSize(13.5).TextColor(p.TextPrimary).MinWidth(0).Selectable()
+				ui.Text(c, entry.Text).FontSize(FontBody).LineHeight(1.55).TextColor(p.TextPrimary).MinWidth(0).Selectable()
 			})
 
-			// External bottom-right metadata bar (.turn-meta.right)
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Padding(0, 2).Children(func() {
-				if entry.Steered {
-					ui.Row(c).Padding(1, 5).Radius(4).Background(p.WarnSoft).Gap(3).AlignItems(ui.Center).
-						Tooltip("运行中插队注入的纠偏指令").Children(func() {
-						ui.Icon(c, IconBolt).Size(10, 10).TextColor(p.WarnColor)
-						ui.Text(c, "Steer").Bold().Font("Menlo").FontSize(10).TextColor(p.WarnColor)
-					})
-				}
-				if entry.TargetBadge != "" {
-					tagCol := p.LocalColor
-					if isRemote {
-						tagCol = p.SSHColor
+			// Quiet bottom-right metadata & hover-revealed actions
+			hasBadges := entry.Steered || (isRemote && entry.TargetBadge != "")
+			if hasBadges || entry.Text != "" || (canFork && onFork != nil && entry.EntryID != "") {
+				ui.Row(c).Height(22).Gap(6).AlignItems(ui.Center).Padding(0, 2).Children(func() {
+					if entry.Steered {
+						ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.WarnSoft).Gap(3).AlignItems(ui.Center).
+							Tooltip("运行中插队注入的纠偏指令").Children(func() {
+							ui.Icon(c, IconBolt).Size(10, 10).TextColor(p.WarnColor)
+							ui.Text(c, "Steer").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.WarnColor)
+						})
 					}
-					ui.Text(c, entry.TargetBadge).Bold().Font("Menlo").FontSize(10.5).TextColor(tagCol)
-				}
-				if entry.EntryID != "" {
-					ui.Text(c, "#"+shortEntryID(entry.EntryID)).Font("Menlo").FontSize(10.5).TextColor(p.TextMuted)
-				}
-				IconTipBtn(c, p, IconCopy, 22, 12.5, "复制指令", func() {
-					c.WriteClipboard(entry.Text)
-					c.Toast("已复制指令到剪贴板")
-				})
-				if canFork && onFork != nil && entry.EntryID != "" {
-					IconTipBtn(c, p, IconBranch, 22, 12.5, "回退至此处并重新编辑发送", func() {
-						onFork(entry)
+					if isRemote && entry.TargetBadge != "" {
+						ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Gap(4).AlignItems(ui.Center).Children(func() {
+							ui.Icon(c, IconServer).Size(10, 10).TextColor(p.SSHColor)
+							ui.Text(c, entry.TargetBadge).FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.SSHColor)
+						})
+					}
+
+					ui.Row(c).Gap(2).AlignItems(ui.Center).Opacity(actionOp).Children(func() {
+						IconTipBtn(c, p, IconCopy, 22, 12.5, "复制指令", func() {
+							c.WriteClipboard(entry.Text)
+							c.Toast("已复制指令到剪贴板")
+						})
+						if canFork && onFork != nil && entry.EntryID != "" {
+							forkTip := fmt.Sprintf("回退至此处并重新编辑 (#%s)", shortEntryID(entry.EntryID))
+							IconTipBtn(c, p, IconBranch, 22, 12.5, forkTip, func() {
+								onFork(entry)
+							})
+						}
 					})
-				}
-			})
+				})
+			}
 		})
 
 	case EntryAssistant:
-		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Gap(8).Children(func() {
-			// Collapsible Thinking Bar (.thinking-bar)
+		turnWrap := ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Gap(8)
+		showActions := turnWrap.Hovered() || turnWrap.FocusWithin()
+		targetOp := float32(0.0)
+		if showActions {
+			targetOp = 1.0
+		}
+		actionOp := turnWrap.Animate("a-act", targetOp, 140*time.Millisecond)
+
+		turnWrap.Children(func() {
+			// Collapsible Thinking Bar — Quiet & Refined
 			if entry.Thinking != "" {
-				tb := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(3, 6).Radius(6).Gap(6).AlignItems(ui.Center)
-				bg := ui.Transparent
+				tb := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(4, 6).Radius(RadiusSM).Gap(6).AlignItems(ui.Center)
+				targetBg := ui.Transparent
 				if tb.Hovered() || tb.Pressed() {
-					bg = p.BgHover
+					targetBg = p.BgHover
 				}
 				chev := IconChevronRight
 				if entry.ThinkOpen {
 					chev = IconChevronDown
 				}
+				isActivelyThinking := !entry.Done && entry.Text == ""
 				title := "思考过程"
-				if !entry.Done && entry.Text == "" {
+				sparkCol := p.TextMuted
+				if isActivelyThinking {
 					title = "正在思考..."
+					sparkCol = p.Accent
 				}
-				tb.Background(bg).Children(func() {
-					ui.Icon(c, chev).Size(12, 12).TextColor(p.TextMuted).Shrink(0)
-					ui.Text(c, title).FontSize(12).TextColor(p.TextSecondary).Shrink(0)
+				tb.Background(targetBg).Children(func() {
+					ui.Icon(c, IconSparkles).Size(12.5, 12.5).TextColor(sparkCol).Shrink(0)
+					ui.Text(c, title).FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary).Shrink(0)
 					if !entry.ThinkOpen {
 						preview := singleLinePreview(entry.Thinking, 64)
 						if preview != "" {
-							ui.Text(c, "· "+preview).Font("Menlo").FontSize(11.5).TextColor(p.TextMuted).
+							ui.Text(c, preview).FontSize(FontSmall).TextColor(p.TextMuted).
 								Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
 						}
+					} else {
+						ui.Spacer(c)
 					}
+					ui.Icon(c, chev).Size(12, 12).TextColor(p.TextMuted).Shrink(0)
 				})
 				if tb.Clicked() {
 					entry.ThinkOpen = !entry.ThinkOpen
 				}
 
 				if entry.ThinkOpen {
-					ui.Column(c).FillWidth().MinWidth(0).Padding(8, 12).Radius(8).
-						Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-						ui.Text(c, entry.Thinking).Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).
+					// Clean left-quote bar instead of a heavy nested box
+					ui.Column(c).FillWidth().MinWidth(0).Margin(0, 0, 2, 6).Padding(4, 0, 4, 12).
+						BorderWidth(0, 0, 0, 2).BorderColor(p.BorderStrong).Children(func() {
+						ui.Text(c, entry.Thinking).FontSize(FontSmall).LineHeight(1.58).TextColor(p.TextSecondary).
 							FillWidth().MinWidth(0).Selectable()
 					})
 				}
@@ -199,19 +276,20 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 					markdown.Stream(c, entry.Text, mdOpts)
 				}
 			} else if !entry.Done && entry.Thinking == "" {
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(4, 0).Children(func() {
-					ui.Spinner(c).Size(14, 14)
-					ui.Text(c, "Agent 正在响应...").FontSize(13).TextColor(p.TextMuted)
+				ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(4, 2).Children(func() {
+					ui.Spinner(c).Size(13, 13)
+					ui.Text(c, "正在思考并组织响应...").FontSize(FontSmall).TextColor(p.TextMuted)
 				})
 			}
 
+			// Refined API / Execution Error Card
 			if entry.ErrorText != "" {
 				parsedErr := ParseAPIError(entry.ErrorText)
-				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Radius(8).
-					Background(p.DangerSoft).Border(1, p.DangerColor).Gap(6).Children(func() {
+				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Radius(RadiusMD).
+					Background(p.DangerSoft).Border(1, p.DangerColor.Alpha(0.38)).Gap(6).Children(func() {
 					ui.Row(c).FillWidth().MinWidth(0).Gap(6).AlignItems(ui.Center).Children(func() {
-						ui.Icon(c, IconShieldAlert).Size(15, 15).TextColor(p.DangerColor).Shrink(0)
-						ui.Text(c, parsedErr.Title).Bold().FontSize(12.5).TextColor(p.DangerColor).
+						ui.Icon(c, IconShieldAlert).Size(14.5, 14.5).TextColor(p.DangerColor).Shrink(0)
+						ui.Text(c, parsedErr.Title).FontWeight(WeightSemibold).FontSize(FontSmall).TextColor(p.DangerColor).
 							Grow(1).MinWidth(0).Selectable()
 						IconTipBtn(c, p, IconCopy, 24, 13, "复制完整报错信息", func() {
 							c.WriteClipboard(entry.ErrorText)
@@ -228,128 +306,157 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 						}
 					})
 					if parsedErr.Detail != "" {
-						ui.Text(c, parsedErr.Detail).FontSize(12).TextColor(p.TextPrimary).
+						ui.Text(c, parsedErr.Detail).FontSize(FontSmall).LineHeight(1.5).TextColor(p.TextPrimary).
 							FillWidth().MinWidth(0).Selectable()
 					}
 					if entry.ErrorDetailOpen && parsedErr.PrettyRaw != "" {
-						ui.Column(c).FillWidth().MinWidth(0).Padding(8, 10).Radius(6).
+						ui.Column(c).FillWidth().MinWidth(0).Padding(8, 10).Radius(RadiusSM).
 							Background(p.CodeBg).Border(1, p.BorderSubtle).Children(func() {
 							ui.Text(c, truncatePreview(parsedErr.PrettyRaw, 1600)).
-								Font("Menlo").FontSize(11).TextColor(p.TextSecondary).
+								Font(FontMono).FontSize(FontCaption).LineHeight(1.45).TextColor(p.TextSecondary).
 								FillWidth().MinWidth(0).Selectable()
 						})
 					}
 				})
 			}
 
-			// External bottom-left icon action bar (.turn-meta.left)
-			if entry.Done && (entry.Text != "" || entry.EntryID != "") {
-				ui.Row(c).Gap(4).AlignItems(ui.Center).Padding(2, 0).Children(func() {
-					if entry.Text != "" {
-						IconTipBtn(c, p, IconCopy, 24, 13, "复制回复", func() {
-							c.WriteClipboard(entry.Text)
-							c.Toast("已复制助手回复到剪贴板")
-						})
-					}
+			// Quiet Hover-Revealed Turn Actions (Copy / Fork) — omitted on intermediate steps before tool cards
+			if showTurnFooter && entry.Done && entry.Text != "" {
+				ui.Row(c).Height(22).Gap(3).AlignItems(ui.Center).Opacity(actionOp).Children(func() {
+					IconTipBtn(c, p, IconCopy, 22, 12.5, "复制回复", func() {
+						c.WriteClipboard(entry.Text)
+						c.Toast("已复制助手回复到剪贴板")
+					})
 					if canFork && onFork != nil && entry.EntryID != "" {
-						IconTipBtn(c, p, IconBranch, 24, 13, "从此处分叉会话", func() {
+						forkTip := fmt.Sprintf("从此处分叉会话 (#%s)", shortEntryID(entry.EntryID))
+						IconTipBtn(c, p, IconBranch, 22, 12.5, forkTip, func() {
 							onFork(entry)
 						})
-					}
-					if entry.EntryID != "" {
-						ui.Text(c, "#"+shortEntryID(entry.EntryID)).
-							Font("Menlo").FontSize(10.5).TextColor(p.TextMuted).Padding(0, 4).
-							Tooltip("会话树节点 ID: " + entry.EntryID)
 					}
 				})
 			}
 		})
 
 	case EntryTool:
-		// Compact Collapsible Tool Card (.tool-card)
-		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Radius(9).
-			Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-			// Tool Card Header
-			hb := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(7, 11).Gap(8).AlignItems(ui.Center)
-			bg := ui.Transparent
+		toolIcon, toolLabel := toolVisualMeta(entry.ToolName)
+		hasDiff := entry.DiffOld != "" || entry.DiffNew != ""
+		hasBody := hasDiff || entry.ToolOutput != ""
+
+		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Radius(RadiusMD).
+			Background(p.BgSurface).Border(1, p.BorderSubtle).Clip().Children(func() {
+			// Compact Semantic Tool Header (34px)
+			hb := ui.ButtonBase(c).FillWidth().MinWidth(0).Height(34).Padding(0, 10).Gap(8).AlignItems(ui.Center)
+			targetBg := ui.Transparent
 			if hb.Hovered() || hb.Pressed() {
-				bg = p.BgHover
+				targetBg = p.BgHover
 			}
-			hb.Background(bg).Children(func() {
+			hb.Background(targetBg).Children(func() {
+				// Leading status / semantic icon
 				if entry.ToolRunning {
 					ui.Spinner(c).Size(13, 13)
 				} else if entry.ToolError {
-					ui.Icon(c, IconCross).Size(13, 13).TextColor(p.DangerColor).Shrink(0)
+					ui.Icon(c, IconCross).Size(13.5, 13.5).TextColor(p.DangerColor).Shrink(0)
 				} else {
-					ui.Icon(c, IconCheck).Size(13, 13).TextColor(p.LocalColor).Shrink(0)
+					ui.Icon(c, toolIcon).Size(13.5, 13.5).TextColor(p.TextMuted).Shrink(0)
 				}
 
-				ui.Text(c, "["+entry.ToolName+"]").Bold().Font("Menlo").FontSize(12).TextColor(p.TextPrimary).Shrink(0)
+				ui.Text(c, toolLabel).Font(FontMono).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).Shrink(0)
+
 				if entry.ToolSummary != "" {
-					ui.Text(c, singleLinePreview(entry.ToolSummary, 62)).Font("Menlo").FontSize(12).TextColor(p.TextSecondary).
+					ui.Text(c, singleLinePreview(entry.ToolSummary, 68)).
+						Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.TextMuted).
 						Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
 				} else {
 					ui.Spacer(c)
 				}
-				if entry.ToolRunning {
-					ui.Text(c, "· 执行中...").Font("Menlo").FontSize(11).TextColor(p.TextMuted).Shrink(0)
-				} else if entry.DurationMs > 0 {
-					ui.Text(c, fmt.Sprintf("· %dms", entry.DurationMs)).Font("Menlo").FontSize(11).TextColor(p.TextMuted).Shrink(0)
-				}
 
-				if entry.TargetBadge != "" {
-					pillBg := p.LocalSoft
-					pillFg := p.LocalColor
-					if isRemote {
-						pillBg = p.SSHSoft
-						pillFg = p.SSHColor
-					}
-					ui.Row(c).Padding(1, 7).Radius(4).Background(pillBg).Shrink(0).Children(func() {
-						ui.Text(c, entry.TargetBadge).Bold().Font("Menlo").FontSize(10.5).TextColor(pillFg)
+				// Remote SSH badge ONLY when remote (keeps local tool calls whisper-quiet)
+				if isRemote && entry.TargetBadge != "" {
+					ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Shrink(0).Gap(4).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, entry.TargetBadge).Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
 					})
 				}
 
-				chev := IconChevronRight
-				if entry.CardOpen {
-					chev = IconChevronDown
+				if entry.ToolRunning {
+					ui.Text(c, "执行中").FontSize(FontCaption).TextColor(p.Accent).Shrink(0)
+				} else {
+					if entry.DurationMs > 0 {
+						ui.Text(c, fmt.Sprintf("%dms", entry.DurationMs)).
+							FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
+					}
+					if !entry.ToolError {
+						ui.Icon(c, IconCheck).Size(12, 12).TextColor(p.LocalColor).Shrink(0)
+					}
 				}
-				ui.Icon(c, chev).Size(13, 13).TextColor(p.TextMuted).Shrink(0)
+
+				if hasBody {
+					chev := IconChevronRight
+					if entry.CardOpen {
+						chev = IconChevronDown
+					}
+					ui.Icon(c, chev).Size(12.5, 12.5).TextColor(p.TextMuted).Shrink(0)
+				}
 			})
-			if hb.Clicked() {
+			if hb.Clicked() && hasBody {
 				entry.CardOpen = !entry.CardOpen
 			}
 
-			// Tool Card Body (.tool-body)
-			if entry.CardOpen {
-				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Gap(7).
+			// Tool Card Body — Unified Single-Surface Code/Diff View (no multi-box nesting!)
+			if entry.CardOpen && hasBody {
+				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Gap(8).
+					Background(p.CodeBg).
 					BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
-					if entry.DiffOld != "" || entry.DiffNew != "" {
-						ui.Text(c, "Diff 预览:").FontSize(11).TextColor(p.TextMuted)
-						if entry.DiffOld != "" {
-							ui.Column(c).FillWidth().MinWidth(0).Padding(6, 10).Radius(6).Background(p.DiffDelBg).Children(func() {
-								ui.Text(c, "- "+truncatePreview(entry.DiffOld, 600)).
-									Font("Menlo").FontSize(11.5).TextColor(p.DiffDelFg).FillWidth().MinWidth(0).Selectable()
-							})
+					if hasDiff {
+						renderUnifiedDiffLines(c, p, entry.DiffOld, entry.DiffNew)
+						if entry.ToolOutput != "" {
+							outCol := p.TextMuted
+							if entry.ToolError {
+								outCol = p.DangerColor
+							}
+							ui.Text(c, truncatePreview(entry.ToolOutput, 400)).
+								Font(FontMono).FontSize(FontCaption).LineHeight(1.45).TextColor(outCol).
+								FillWidth().MinWidth(0).Selectable()
 						}
-						if entry.DiffNew != "" {
-							ui.Column(c).FillWidth().MinWidth(0).Padding(6, 10).Radius(6).Background(p.DiffAddBg).Children(func() {
-								ui.Text(c, "+ "+truncatePreview(entry.DiffNew, 600)).
-									Font("Menlo").FontSize(11.5).TextColor(p.DiffAddFg).FillWidth().MinWidth(0).Selectable()
-							})
+					} else if entry.ToolOutput != "" {
+						outCol := p.TextSecondary
+						if entry.ToolError {
+							outCol = p.DangerColor
 						}
-					}
-
-					if entry.ToolOutput != "" {
-						ui.Column(c).FillWidth().MinWidth(0).Padding(8, 10).Radius(6).
-							Background(p.CodeBg).Border(1, p.BorderSubtle).Children(func() {
-							ui.Text(c, truncatePreview(entry.ToolOutput, 1600)).
-								Font("Menlo").FontSize(11.5).TextColor(p.TextSecondary).FillWidth().MinWidth(0).Selectable()
-						})
+						ui.Text(c, truncatePreview(entry.ToolOutput, 1600)).
+							Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.48).TextColor(outCol).
+							FillWidth().MinWidth(0).Selectable()
 					}
 				})
 			}
 		})
 	}
+}
+
+// renderUnifiedDiffLines renders old/new edit hunks in a single cohesive IDE-style diff view.
+func renderUnifiedDiffLines(c *ui.Context, p Palette, diffOld, diffNew string) {
+	ui.Column(c).FillWidth().MinWidth(0).Radius(RadiusSM).
+		Border(1, p.BorderSubtle).Clip().Children(func() {
+		if diffOld != "" {
+			oldText := truncatePreview(diffOld, 600)
+			for _, line := range strings.Split(oldText, "\n") {
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Background(p.DiffDelBg).Gap(8).Children(func() {
+					ui.Text(c, "-").Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.DiffDelFg).Shrink(0).Unselectable()
+					ui.Text(c, line).Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.42).TextColor(p.DiffDelFg).
+						Grow(1).MinWidth(0).PreserveSpaces().Selectable()
+				})
+			}
+		}
+		if diffNew != "" {
+			newText := truncatePreview(diffNew, 600)
+			for _, line := range strings.Split(newText, "\n") {
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Background(p.DiffAddBg).Gap(8).Children(func() {
+					ui.Text(c, "+").Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.DiffAddFg).Shrink(0).Unselectable()
+					ui.Text(c, line).Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.42).TextColor(p.DiffAddFg).
+						Grow(1).MinWidth(0).PreserveSpaces().Selectable()
+				})
+			}
+		}
+	})
 }
 
 // ParsedAPIError holds a humanized breakdown of a raw LLM / gateway / Cloudflare error.

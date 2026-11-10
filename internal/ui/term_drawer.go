@@ -13,7 +13,7 @@ var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1
 type TermLine struct {
 	ID   int
 	Text string
-	Kind string // "cmd", "meta", "err", "out"
+	Kind string // "cmd", "meta", "warn", "err", "out"
 }
 
 // TermDrawer renders a pure-Go GPU-accelerated live terminal output stream
@@ -23,24 +23,26 @@ type TermDrawer struct {
 	NextID    int
 	ListState ui.ListState
 	Open      bool
+	Unread    bool
 	Width     float32
 	partial   string
 }
 
-// NewTermDrawer creates a default live output drawer.
+// NewTermDrawer creates a default live output drawer (collapsed initially to keep the main stage calm).
 func NewTermDrawer() *TermDrawer {
-	td := &TermDrawer{
-		Open:  true,
-		Width: 360,
+	return &TermDrawer{
+		Open:  false,
+		Width: DefaultTermWidth,
 	}
-	td.AppendChunk("─── PiUI Live Bash Stream Ready ───\n")
-	return td
 }
 
 // AppendChunk splits incoming raw stdout/stderr bytes into lines and classifies them for styling.
 func (d *TermDrawer) AppendChunk(chunk string) {
 	if chunk == "" {
 		return
+	}
+	if !d.Open {
+		d.Unread = true
 	}
 	chunk = strings.ReplaceAll(chunk, "\r\n", "\n")
 	chunk = strings.ReplaceAll(chunk, "\r", "\n")
@@ -89,7 +91,7 @@ func (d *TermDrawer) pushLine(line string) {
 func (d *TermDrawer) Clear() {
 	d.Lines = nil
 	d.partial = ""
-	d.AppendChunk("─── Output Cleared ───\n")
+	d.Unread = false
 }
 
 // AllText returns the complete text buffer for clipboard copying.
@@ -105,11 +107,12 @@ func (d *TermDrawer) AllText() string {
 	return sb.String()
 }
 
-// View renders the right-hand terminal output drawer.
+// View renders the right-hand terminal output drawer inside its split pane.
 func (d *TermDrawer) View(c *ui.Context, p Palette) {
 	if !d.Open {
 		return
 	}
+	d.Unread = false
 
 	d.ListState.Key = func(i int) any {
 		if i < len(d.Lines) {
@@ -125,14 +128,19 @@ func (d *TermDrawer) View(c *ui.Context, p Palette) {
 		totalRows++
 	}
 
-	ui.Column(c).Width(d.Width).Shrink(0).FillHeight().Clip().Background(p.BgTerm).
-		BorderWidth(0, 0, 0, 1).BorderColor(p.BorderSubtle).Children(func() {
-		// 44px Header bar
-		ui.Row(c).FillWidth().MinWidth(0).Height(44).Padding(0, 10, 0, 14).Gap(4).
+	bar := c.TitleBar()
+	rightPad := max(bar.Right, 10)
+
+	ui.Column(c).Direction(ui.LeftToRight).Fill().Clip().Background(p.BgTerm).Children(func() {
+		// Unified 44px Top Header Bar aligned with CenterMain and LeftSidebar
+		ui.Row(c).FillWidth().MinWidth(0).Height(TopBarHeight).Padding(0, rightPad, 0, 14).Gap(6).
 			AlignItems(ui.Center).Background(p.BgTermHeader).
-			BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
-			ui.Icon(c, IconTerminal).Size(14, 14).TextColor(p.LocalColor)
-			ui.Text(c, "实时输出").Bold().FontSize(12).TextColor(p.TextPrimary)
+			BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).DragWindow().Children(func() {
+			ui.Icon(c, IconTerminal).Size(14, 14).TextColor(p.TextSecondary)
+			ui.Text(c, "实时输出").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).SingleLine()
+			if totalRows > 0 {
+				ui.Textf(c, "%d", totalRows).FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Padding(0, 2)
+			}
 			ui.Spacer(c)
 			IconTipBtn(c, p, IconCopy, 26, 13.5, "复制全部终端输出", func() {
 				c.WriteClipboard(d.AllText())
@@ -146,7 +154,7 @@ func (d *TermDrawer) View(c *ui.Context, p Palette) {
 			})
 		})
 
-		// Scrollable log lines
+		// Scrollable log lines or quiet empty state
 		ui.List(c, &d.ListState, totalRows, func(i int) {
 			var line TermLine
 			if i < len(d.Lines) {
@@ -172,15 +180,25 @@ func (d *TermDrawer) View(c *ui.Context, p Palette) {
 				display = " "
 			}
 			el := ui.Text(c, display).
-				Font("Menlo").
-				FontSize(11.5).
+				Font(FontMono).
+				FontSize(FontCaption + 0.5).
+				LineHeight(1.45).
 				TextColor(color).
 				FillWidth().
 				MinWidth(0).
 				Selectable()
 			if line.Kind == "cmd" {
-				el.Bold()
+				el.FontWeight(WeightMedium)
 			}
-		}).Grow(1).MinWidth(0).Padding(12, 14).Gap(3)
+		}).Grow(1).MinWidth(0).Padding(12, 14).Gap(3).Children(func() {
+			if totalRows == 0 {
+				ui.Column(c).Margin(ui.Auto).AlignItems(ui.Center).Gap(6).Padding(24).Children(func() {
+					ui.Icon(c, IconTerminal).Size(20, 20).TextColor(p.TextMuted)
+					ui.Text(c, "暂无实时命令输出").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+					ui.Text(c, "当 Agent 执行 bash 命令时，标准输出与错误流将在此实时滚动显示。").
+						FontSize(FontCaption).LineHeight(1.5).TextColor(p.TextMuted).TextAlign(ui.Center)
+				})
+			}
+		})
 	})
 }
