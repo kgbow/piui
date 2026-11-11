@@ -337,3 +337,60 @@ func TestNewSessionClearsTrustedSignatures(t *testing.T) {
 		t.Fatalf("expected TrustedCount=0 after starting new session, got %d", got)
 	}
 }
+
+func TestBashSensitiveRedirectionAndInterpreterBypasses(t *testing.T) {
+	localTarget := store.WorkspaceTarget{
+		ID:       "local-cwd",
+		Name:     "Local",
+		IsRemote: false,
+		WorkDir:  "/Users/test/project",
+	}
+	remoteTarget := store.WorkspaceTarget{
+		ID:       "ssh-prod",
+		Name:     "Prod SSH",
+		IsRemote: true,
+		WorkDir:  "/srv/app",
+		SSHHost:  "prod-box",
+	}
+
+	criticalCommands := []string{
+		`echo "ssh-ed25519 AAAA" >> ~/.ssh/authorized_keys`,
+		`printf "127.0.0.1 evil\n" | sudo tee -a /etc/hosts`,
+		`cp /tmp/nginx.conf /etc/nginx/nginx.conf`,
+		`bash -c "rm -rf /"`,
+		`sh -lc 'dd if=/dev/zero of=/dev/sda'`,
+	}
+	for _, cmd := range criticalCommands {
+		got := AssessToolCallRisk(localTarget, store.SafetyPolicyRemoteHighRisk, "bash", map[string]any{"command": cmd})
+		if got == nil || got.Level != RiskCritical {
+			t.Fatalf("expected critical interception for %q even on local workspace, got %+v", cmd, got)
+		}
+	}
+
+	remoteHighRiskCommands := []string{
+		`sed -i 's/DEBUG=false/DEBUG=true/' .env.production`,
+		`echo "API_SECRET=xyz" > .env`,
+		`find /var/log -name '*.old' -exec rm -f {} +`,
+		`ls *.tmp | xargs rm -rf`,
+		`python3 -c "import shutil; shutil.rmtree('dist')"`,
+		`node -e "require('fs').rmSync('build', {recursive: true})"`,
+	}
+	for _, cmd := range remoteHighRiskCommands {
+		got := AssessToolCallRisk(remoteTarget, store.SafetyPolicyRemoteHighRisk, "bash", map[string]any{"command": cmd})
+		if got == nil {
+			t.Fatalf("expected remote high-risk interception for %q, got nil", cmd)
+		}
+	}
+
+	// Read-only inspection of sensitive files must NOT be falsely flagged under RemoteHighRisk.
+	safeReads := []string{
+		`cat ~/.ssh/config`,
+		`grep -n PORT .env`,
+		`head -n 10 /etc/hosts`,
+	}
+	for _, cmd := range safeReads {
+		if got := AssessToolCallRisk(remoteTarget, store.SafetyPolicyRemoteHighRisk, "bash", map[string]any{"command": cmd}); got != nil {
+			t.Fatalf("expected read-only command %q NOT to be flagged as mutation under RemoteHighRisk, got %+v", cmd, got)
+		}
+	}
+}

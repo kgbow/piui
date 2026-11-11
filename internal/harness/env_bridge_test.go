@@ -82,13 +82,18 @@ func TestApplyRemoteEditsPreservesCRLFAndChecksUniqueness(t *testing.T) {
 }
 
 func TestSSHMultiplexArgsAndRemoteSkillsParsing(t *testing.T) {
+	sockPat := sshControlSocketPattern()
 	args := sshMultiplexArgs("prod-gateway", "bash", "-c", "uptime")
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "ControlMaster=auto") || !strings.Contains(joined, "ControlPersist=10m") || !strings.Contains(joined, "ControlPath=/tmp/piui-ssh-%C") {
-		t.Fatalf("expected SSH multiplexing flags in %q", joined)
+	if !strings.Contains(joined, "ControlMaster=auto") || !strings.Contains(joined, "ControlPersist=10m") || !strings.Contains(joined, "ControlPath="+sockPat) {
+		t.Fatalf("expected SSH multiplexing flags with %q in %q", sockPat, joined)
+	}
+	sockDir := filepath.Dir(sockPat)
+	if st, err := os.Stat(sockDir); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("expected private 0700 SSH control socket dir %q, err=%v mode=%v", sockDir, err, st)
 	}
 
-	rawSkillOutput := `===PIUI_SKILL_FILE:.pi/skills/deploy/SKILL.md===
+	rawSkillOutput := `===PIUI_SKILL_FILE:/srv/app/.pi/skills/deploy/SKILL.md===
 ---
 name: prod-deploy
 description: Rolling zero-downtime deployment on prod-gateway
@@ -103,6 +108,9 @@ description: Rolling zero-downtime deployment on prod-gateway
 	}
 	if skills[0].Name != "prod-deploy" || !strings.Contains(skills[0].Description, "Rolling zero-downtime") {
 		t.Fatalf("unexpected first skill: %+v", skills[0])
+	}
+	if skills[0].FilePath != "/srv/app/.pi/skills/deploy/SKILL.md" {
+		t.Fatalf("expected real remote POSIX FilePath (not ssh:// URI), got %q", skills[0].FilePath)
 	}
 	if skills[1].Name != "nginx-diag" {
 		t.Fatalf("expected fallback folder name 'nginx-diag', got %+v", skills[1])

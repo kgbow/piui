@@ -3,14 +3,17 @@ package ui
 import (
 	"context"
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 	"github.com/sky-valley/pi/coding"
 
 	"piui/internal/harness"
+	"piui/internal/mcp"
 	"piui/internal/store"
 )
 
@@ -45,22 +48,49 @@ type SettingsModal struct {
 	draft     store.AppConfig
 	saveError string
 
-	// Model fetching state (per profile ID)
+	// Model fetching & live connection test state (per profile ID)
 	fetchingModels bool
+	testingConn    bool
 	fetchStatus    string
 	fetchError     string
 	fetchedModels  map[string][]string
 	modelSearch    string
 
-	// New target draft fields
-	NewTargetRemote  bool
-	NewTargetName    string
-	NewTargetWorkDir string
-	NewTargetSSHHost string
+	// New workspace target draft & SSH browser state
+	NewTargetRemote   bool
+	NewTargetName     string
+	NewTargetWorkDir  string
+	NewTargetSSHHost  string
+	browsingRemote    bool
+	remoteDirsLoaded  bool
+	remoteResolvedDir string
+	remoteSubdirs     []string
+	remoteProbeStatus string
+	remoteProbeError  string
+
+	// MCP server draft & live tool discovery state
+	NewMCPHTTP    bool
+	NewMCPName    string
+	NewMCPCmdLine string
+	NewMCPEnv     string
+	NewMCPURL     string
+	NewMCPBearer  string
+	probingMCP    bool
+	mcpProbeNote  string
+	mcpProbeError string
+	mcpProbeCache map[string]mcp.ServerStatus
 }
 
 // Render draws the Antigravity settings modal with fixed height so tab switches never jump.
-func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, mgr *harness.Manager, updateUI func(func()), onApply func() error) {
+func (s *SettingsModal) Render(
+	c *ui.Context,
+	p Palette,
+	win *mygo.Window,
+	cfg *store.AppConfig,
+	mgr *harness.Manager,
+	updateUI func(func()),
+	onApply func() error,
+) {
 	if !s.Open {
 		s.editing = false
 		s.saveError = ""
@@ -71,9 +101,22 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 		if s.fetchedModels == nil {
 			s.fetchedModels = map[string][]string{}
 		}
+		if s.mcpProbeCache == nil {
+			s.mcpProbeCache = map[string]mcp.ServerStatus{}
+		}
+		if mgr != nil {
+			for _, st := range mgr.MCPStatuses() {
+				s.mcpProbeCache[st.ID] = st
+			}
+		}
 		s.fetchStatus = ""
 		s.fetchError = ""
 		s.saveError = ""
+		s.remoteProbeStatus = ""
+		s.remoteProbeError = ""
+		s.mcpProbeNote = ""
+		s.mcpProbeError = ""
+		s.remoteDirsLoaded = false
 		s.editing = true
 	}
 
@@ -90,7 +133,7 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 				BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
 				ui.Icon(c, IconSettings).Size(15, 15).TextColor(p.TextSecondary)
 				ui.Text(c, "偏好设置").FontWeight(WeightSemibold).FontSize(FontTitle).TextColor(p.TextPrimary)
-				ui.Text(c, "渠道模型 · 工作区 · 安全策略").FontSize(FontSmall).TextColor(p.TextMuted).Padding(0, 4)
+				ui.Text(c, "渠道模型 · 工作区 · 安全 · MCP").FontSize(FontSmall).TextColor(p.TextMuted).Padding(0, 4)
 				ui.Spacer(c)
 				IconTipBtn(c, p, IconCross, 28, 14, "关闭设置 (Esc)", func() {
 					s.Open = false
@@ -98,12 +141,13 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 				})
 			})
 
-			// Fixed 3-Segment Navigation Bar
+			// Fixed 4-Segment Navigation Bar
 			ui.Column(c).FillWidth().Shrink(0).Padding(12, 20, 6, 20).Children(func() {
 				tabTitles := []string{
 					"渠道与模型",
 					fmt.Sprintf("工作区 (%d)", len(s.draft.Targets)),
 					fmt.Sprintf("安全与 Skills (%d)", len(skills)),
+					fmt.Sprintf("MCP 扩展 (%d)", len(s.draft.MCPServers)),
 				}
 				SegmentedBar(c, p, &s.ActiveTab, tabTitles)
 			})
@@ -115,9 +159,11 @@ func (s *SettingsModal) Render(c *ui.Context, p Palette, cfg *store.AppConfig, m
 					case 0:
 						s.renderProviderTab(c, p, &s.draft, updateUI)
 					case 1:
-						s.renderTargetsTab(c, p, &s.draft, cfg, onApply)
-					default:
+						s.renderTargetsTab(c, p, win, &s.draft, cfg, updateUI, onApply)
+					case 2:
 						s.renderSafetyAndSkillsTab(c, p, &s.draft, mgr, skills)
+					default:
+						s.renderMCPTab(c, p, &s.draft, cfg, mgr, updateUI, onApply)
 					}
 				})
 			})
@@ -185,6 +231,11 @@ func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func() erro
 	cfg.Targets = make([]store.WorkspaceTarget, len(s.draft.Targets))
 	copy(cfg.Targets, s.draft.Targets)
 
+	cfg.MCPServers = make([]store.MCPServerConfig, len(s.draft.MCPServers))
+	for i, ms := range s.draft.MCPServers {
+		cfg.MCPServers[i] = ms.Clone()
+	}
+
 	cfg.SafetyPolicy = s.draft.SafetyPolicy
 	if cfg.SafetyPolicy == "" {
 		cfg.SafetyPolicy = store.SafetyPolicyRemoteHighRisk
@@ -201,6 +252,38 @@ func (s *SettingsModal) commitToConfig(cfg *store.AppConfig, onApply func() erro
 		}
 	}
 	return nil
+}
+
+func (s *SettingsModal) triggerTestConnection(prof store.ProviderProfile, updateUI func(func())) {
+	if s.testingConn {
+		return
+	}
+	s.testingConn = true
+	s.fetchStatus = ""
+	s.fetchError = ""
+
+	runUpdate := func(fn func()) {
+		if updateUI != nil {
+			updateUI(fn)
+		} else {
+			fn()
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+		defer cancel()
+
+		res, err := harness.TestProviderConnection(ctx, prof)
+		runUpdate(func() {
+			s.testingConn = false
+			if err != nil {
+				s.fetchError = "连接测试失败: " + err.Error()
+				return
+			}
+			s.fetchStatus = "✓ " + res.Message
+		})
+	}()
 }
 
 func (s *SettingsModal) triggerFetchModels(prof store.ProviderProfile, updateUI func(func())) {
@@ -253,6 +336,96 @@ func (s *SettingsModal) triggerFetchModels(prof store.ProviderProfile, updateUI 
 					break
 				}
 			}
+		})
+	}()
+}
+
+func (s *SettingsModal) triggerBrowseLocalDir(win *mygo.Window, updateUI func(func())) {
+	runUpdate := func(fn func()) {
+		if updateUI != nil {
+			updateUI(fn)
+		} else {
+			fn()
+		}
+	}
+	go func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent:            win,
+			Title:             "选择本地项目目录",
+			Directory:         true,
+			CreateDirectories: true,
+		})
+		if err != nil || len(paths) == 0 {
+			return
+		}
+		picked := strings.TrimSpace(paths[0])
+		if picked == "" {
+			return
+		}
+		runUpdate(func() {
+			s.NewTargetWorkDir = picked
+			if strings.TrimSpace(s.NewTargetName) == "" {
+				s.NewTargetName = filepath.Base(picked)
+			}
+		})
+	}()
+}
+
+func (s *SettingsModal) triggerBrowseRemoteDir(targetDir string, updateUI func(func())) {
+	sshHost := strings.TrimSpace(s.NewTargetSSHHost)
+	if sshHost == "" || s.browsingRemote {
+		if sshHost == "" {
+			s.remoteProbeError = "请先手动填写 SSH 主机地址"
+		}
+		return
+	}
+	if strings.TrimSpace(targetDir) == "" {
+		targetDir = strings.TrimSpace(s.NewTargetWorkDir)
+	}
+	if targetDir == "" {
+		targetDir = "~"
+	}
+
+	s.browsingRemote = true
+	s.remoteProbeError = ""
+	s.remoteProbeStatus = ""
+
+	runUpdate := func(fn func()) {
+		if updateUI != nil {
+			updateUI(fn)
+		} else {
+			fn()
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		st := harness.ProbeSSHWorkspace(ctx, sshHost, targetDir)
+		if !st.Connected {
+			runUpdate(func() {
+				s.browsingRemote = false
+				s.remoteProbeError = "SSH 连接或目录检测失败: " + st.Error
+			})
+			return
+		}
+		resolved, dirs, listErr := harness.ListRemoteDirectories(ctx, sshHost, st.ResolvedWorkDir)
+		runUpdate(func() {
+			s.browsingRemote = false
+			if listErr != nil {
+				s.remoteProbeError = "列出远端目录失败: " + listErr.Error()
+				return
+			}
+			s.remoteDirsLoaded = true
+			s.remoteResolvedDir = resolved
+			s.remoteSubdirs = dirs
+			s.NewTargetWorkDir = resolved
+			osInfo := st.RemoteOS
+			if osInfo == "" {
+				osInfo = "SSH"
+			}
+			s.remoteProbeStatus = fmt.Sprintf("✓ 已连接 %s (%s · %dms)", sshHost, osInfo, st.LatencyMs)
 		})
 	}()
 }
@@ -404,11 +577,18 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 			}
 		})
 
-		// API Key input
+		// API Key input + System Keychain indicator
 		ui.Column(c).FillWidth().Gap(5).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
 				ui.Text(c, "API Key").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
-				ui.Text(c, "留空则自动读取环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY").FontSize(FontCaption).TextColor(p.TextMuted)
+				if prof.KeychainStored || (store.ActiveSecretStore() != nil && strings.TrimSpace(prof.APIKey) != "") {
+					ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.LocalSoft).Gap(4).AlignItems(ui.Center).Children(func() {
+						ui.Icon(c, IconShieldCheck).Size(10.5, 10.5).TextColor(p.LocalColor)
+						ui.Text(c, "系统钥匙串加密保护").FontSize(FontCaption).TextColor(p.LocalColor)
+					})
+				} else {
+					ui.Text(c, "留空则自动读取环境变量 ANTHROPIC_API_KEY / OPENAI_API_KEY").FontSize(FontCaption).TextColor(p.TextMuted)
+				}
 			})
 			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
 				in := ui.TextInput(c, &prof.APIKey).Grow(1).Font(FontMono).Placeholder("sk-...")
@@ -454,6 +634,27 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 					})
 				}
 
+				// One-click Live Connection Test Button
+				tb := ui.ButtonBase(c).Height(26).Padding(0, 9).Radius(RadiusSM).
+					Border(1, p.BorderSubtle).Gap(5).
+					AlignItems(ui.Center).Justify(ui.Center).Disabled(s.testingConn).
+					Tooltip("发送最小探测请求验证接口地址、协议与密钥").Label("测试连接")
+				tBg := p.InputBg
+				if tb.Hovered() && !s.testingConn {
+					tBg = p.BgHover
+				}
+				tb.Background(tBg).Children(func() {
+					if s.testingConn {
+						ui.Spinner(c).Size(11.5, 11.5)
+					} else {
+						ui.Icon(c, IconBolt).Size(12, 12).TextColor(p.LocalColor)
+					}
+					ui.Text(c, "测试连接").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+				})
+				if tb.Clicked() {
+					s.triggerTestConnection(*prof, updateUI)
+				}
+
 				fb := ui.ButtonBase(c).Height(26).Padding(0, 9).Radius(RadiusSM).
 					Border(1, p.BorderSubtle).Gap(5).
 					AlignItems(ui.Center).Justify(ui.Center).Disabled(s.fetchingModels).
@@ -494,7 +695,7 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 				ui.Text(c, s.fetchStatus).FontSize(FontCaption).TextColor(p.LocalColor)
 			}
 
-			// Model Checklist — Unified AppCheckbox + Star/Default Badge (no Bolt collision!)
+			// Model Checklist — Unified AppCheckbox + Star/Default Badge
 			if len(candidates) > 0 {
 				q := strings.ToLower(strings.TrimSpace(s.modelSearch))
 				ui.Scroll(c).MaxHeight(130).FillWidth().Children(func() {
@@ -562,19 +763,28 @@ func (s *SettingsModal) renderProviderTab(c *ui.Context, p Palette, draft *store
 	})
 }
 
-func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.AppConfig, liveCfg *store.AppConfig, onApply func() error) {
+func (s *SettingsModal) renderTargetsTab(
+	c *ui.Context,
+	p Palette,
+	win *mygo.Window,
+	draft *store.AppConfig,
+	liveCfg *store.AppConfig,
+	updateUI func(func()),
+	onApply func() error,
+) {
 	ui.Column(c).FillWidth().Gap(12).Children(func() {
-		ui.Text(c, "已配置的工作区目标（支持在同一会话中随时一键热切换）：").
+		ui.Text(c, "已配置的工作区（支持本地代码仓库与远程 SSH 开发机，各工作区会话独立隔离）：").
 			FontSize(FontSmall).TextColor(p.TextSecondary)
 
 		ui.Column(c).FillWidth().Gap(5).Children(func() {
 			for i := range draft.Targets {
 				wt := &draft.Targets[i]
+				isCurrent := wt.ID == draft.ActiveTargetID
 				icon := IconFolder
 				iconBg := p.InputBg
 				iconFg := p.TextSecondary
 				if wt.IsRemote {
-					icon = IconServer
+					icon = IconCloud
 					iconBg = p.SSHSoft
 					iconFg = p.SSHColor
 				}
@@ -586,9 +796,38 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 						ui.Icon(c, icon).Size(14, 14).TextColor(iconFg)
 					})
 					ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
-						ui.Text(c, wt.ShortName()).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).SingleLine().Ellipsis("...")
+						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, wt.ShortName()).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).SingleLine().Ellipsis("...")
+							if isCurrent {
+								ui.Row(c).Padding(1, 5).Radius(RadiusSM).Background(p.AccentSoft).Children(func() {
+									ui.Text(c, "当前").FontSize(10).FontWeight(WeightMedium).TextColor(p.Accent)
+								})
+							}
+						})
 						ui.Text(c, wt.DisplaySub()).Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted).SingleLine().Ellipsis("...")
 					})
+
+					// Trust toggle button for project .pi/skills & AGENTS.md
+					trustBtn := ui.ButtonBase(c).Height(22).Padding(0, 7).Radius(RadiusSM).Gap(4).AlignItems(ui.Center).Shrink(0).
+						Tooltip("切换是否信任加载该工作区下的项目级 .pi/skills 与 AGENTS.md")
+					if wt.Trusted {
+						trustBtn.Background(p.LocalSoft).Children(func() {
+							ui.Icon(c, IconShieldCheck).Size(10.5, 10.5).TextColor(p.LocalColor)
+							ui.Text(c, "已信任").FontSize(10).FontWeight(WeightMedium).TextColor(p.LocalColor)
+						})
+					} else {
+						tBg := p.InputBg
+						if trustBtn.Hovered() {
+							tBg = p.BgHover
+						}
+						trustBtn.Background(tBg).Border(1, p.BorderSubtle).Children(func() {
+							ui.Text(c, "未信任").FontSize(10).TextColor(p.TextMuted)
+						})
+					}
+					if trustBtn.Clicked() {
+						wt.Trusted = !wt.Trusted
+					}
+
 					if wt.IsRemote {
 						ui.Row(c).Padding(2, 7).Radius(RadiusSM).Background(p.SSHSoft).Shrink(0).Children(func() {
 							ui.Text(c, "SSH").Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
@@ -596,31 +835,35 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 					} else {
 						ui.Text(c, "本地").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
 					}
-					if len(draft.Targets) > 1 && i > 0 {
+
+					if len(draft.Targets) > 1 {
 						idx := i
-						DangerIconBtn(c, p, IconTrash, 26, 13.5, "移除该工作区目标", func() {
+						DangerIconBtn(c, p, IconTrash, 26, 13.5, "移除该工作区", func() {
 							removedID := draft.Targets[idx].ID
-							draft.Targets = append(draft.Targets[:idx], draft.Targets[idx+1:]...)
-							if draft.ActiveTargetID == removedID {
-								_ = draft.ActiveTarget()
-							}
+							_ = draft.RemoveTarget(removedID)
 						})
 					}
 				})
 			}
 		})
 
-		// Add New Workspace Target Card
+		// Add New Workspace Card (Local Folder Picker + Manual SSH Entry & Remote Browser)
 		ui.Column(c).FillWidth().Padding(12, 14).Radius(RadiusMD).
 			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(10).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "添加新工作区目标").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary)
+				ui.Text(c, "添加工作区").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary)
 				ui.Spacer(c)
-				AppCheckbox(c, p, &s.NewTargetRemote, "远程 SSH 服务器 (复用 ~/.ssh/config)", false)
+				prevRemote := s.NewTargetRemote
+				AppCheckbox(c, p, &s.NewTargetRemote, "远程 SSH 服务器 (手动填写主机与目录)", false)
+				if s.NewTargetRemote != prevRemote {
+					s.remoteDirsLoaded = false
+					s.remoteProbeError = ""
+					s.remoteProbeStatus = ""
+				}
 			})
 
 			ui.Row(c).FillWidth().Gap(8).Children(func() {
-				ui.TextInput(c, &s.NewTargetName).Grow(1).Placeholder("显示名称 (可选，如 prod-gateway)")
+				ui.TextInput(c, &s.NewTargetName).Grow(1).Placeholder("显示名称 (可选，如 gateway-prod)")
 				if s.NewTargetRemote {
 					ui.TextInput(c, &s.NewTargetSSHHost).Grow(1).Font(FontMono).Placeholder("SSH Host 别名或 user@ip")
 				}
@@ -629,55 +872,142 @@ func (s *SettingsModal) renderTargetsTab(c *ui.Context, p Palette, draft *store.
 			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
 				dirHint := "本地目录路径 (如 ~/Documents/code/myproj)"
 				if s.NewTargetRemote {
-					dirHint = "远端工作目录 (如 /srv/gateway 或 ~)"
+					dirHint = "远端项目目录 (如 /srv/gateway 或 ~)"
 				}
 				ui.TextInput(c, &s.NewTargetWorkDir).Grow(1).Font(FontMono).Placeholder(dirHint)
+
+				if !s.NewTargetRemote {
+					GhostBtn(c, p, IconFolder, "浏览...", "打开原生文件夹选择器", func() {
+						s.triggerBrowseLocalDir(win, updateUI)
+					})
+				} else {
+					bb := ui.ButtonBase(c).Height(30).Padding(0, 10).Radius(RadiusSM).
+						Border(1, p.BorderSubtle).Gap(5).AlignItems(ui.Center).Disabled(s.browsingRemote).
+						Tooltip("测试 SSH 连通性并浏览远端目录")
+					bBg := p.InputBg
+					if bb.Hovered() && !s.browsingRemote {
+						bBg = p.BgHover
+					}
+					bb.Background(bBg).Children(func() {
+						if s.browsingRemote {
+							ui.Spinner(c).Size(12, 12)
+						} else {
+							ui.Icon(c, IconFolder).Size(13, 13).TextColor(p.SSHColor)
+						}
+						ui.Text(c, "浏览远端").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
+					})
+					if bb.Clicked() {
+						s.triggerBrowseRemoteDir("", updateUI)
+					}
+				}
+
 				PrimaryBtn(c, p, IconPlus, "添加", "添加工作区目标", func() {
 					workDir := strings.TrimSpace(s.NewTargetWorkDir)
 					sshHost := strings.TrimSpace(s.NewTargetSSHHost)
 					name := strings.TrimSpace(s.NewTargetName)
-					if workDir == "" && s.NewTargetRemote {
-						workDir = "~"
-					}
-					if !s.NewTargetRemote && workDir != "" {
-						workDir = store.ExpandLocalPath(workDir)
-					}
-					if workDir != "" && (!s.NewTargetRemote || sshHost != "") {
-						if name == "" {
-							if s.NewTargetRemote {
-								name = sshHost
-							} else {
-								name = filepath.Base(workDir)
-							}
+					if s.NewTargetRemote {
+						if sshHost == "" {
+							s.saveError = "请先手动输入远程 SSH 主机地址"
+							return
 						}
-						id := fmt.Sprintf("target-%d", time.Now().UnixNano()%100000)
-						newTarget := store.WorkspaceTarget{
-							ID:       id,
-							Name:     name,
-							IsRemote: s.NewTargetRemote,
-							WorkDir:  workDir,
-							SSHHost:  sshHost,
+						if workDir == "" {
+							workDir = "~"
 						}
-						draft.Targets = append(draft.Targets, newTarget)
-						liveCfg.Targets = append(liveCfg.Targets, newTarget)
-						s.NewTargetName = ""
-						s.NewTargetWorkDir = ""
-						s.NewTargetSSHHost = ""
-						if err := liveCfg.Save(); err != nil {
-							s.saveError = "保存新增工作区失败: " + err.Error()
+						added := draft.UpsertSSHTarget(sshHost, workDir, name, false)
+						_ = liveCfg.UpsertSSHTarget(sshHost, workDir, added.Name, false)
+						name = added.ShortName()
+					} else {
+						if workDir == "" {
+							s.saveError = "请先选择或输入本地项目目录路径"
+							return
+						}
+						added := draft.UpsertLocalTarget(workDir, name, false)
+						_ = liveCfg.UpsertLocalTarget(workDir, added.Name, false)
+						name = added.ShortName()
+					}
+
+					s.NewTargetName = ""
+					s.NewTargetWorkDir = ""
+					s.NewTargetSSHHost = ""
+					s.remoteDirsLoaded = false
+					s.remoteProbeStatus = ""
+					s.remoteProbeError = ""
+
+					if err := liveCfg.Save(); err != nil {
+						s.saveError = "保存新增工作区失败: " + err.Error()
+						c.Toast(s.saveError)
+					} else if onApply != nil {
+						if err := onApply(); err != nil {
+							s.saveError = "应用工作区失败: " + err.Error()
 							c.Toast(s.saveError)
-						} else if onApply != nil {
-							if err := onApply(); err != nil {
-								s.saveError = "应用工作区失败: " + err.Error()
-								c.Toast(s.saveError)
-							} else {
-								s.saveError = ""
-								c.Toast("已添加工作区: " + name)
-							}
+						} else {
+							s.saveError = ""
+							c.Toast("已添加工作区: " + name)
 						}
 					}
 				})
 			})
+
+			if s.NewTargetRemote {
+				if s.remoteProbeError != "" {
+					ui.Text(c, s.remoteProbeError).FontSize(FontCaption).TextColor(p.DangerColor)
+				} else if s.remoteProbeStatus != "" {
+					ui.Text(c, s.remoteProbeStatus).FontSize(FontCaption).TextColor(p.LocalColor)
+				}
+
+				if s.remoteDirsLoaded {
+					ui.Column(c).FillWidth().Padding(8, 10).Radius(RadiusSM).
+						Background(p.InputBg).Border(1, p.BorderSubtle).Gap(5).Children(func() {
+						ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
+							ui.Icon(c, IconServer).Size(12, 12).TextColor(p.SSHColor)
+							ui.Text(c, s.remoteResolvedDir).Font(FontMono).FontSize(FontCaption).FontWeight(WeightMedium).
+								TextColor(p.TextPrimary).Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
+							if s.remoteResolvedDir != "/" && s.remoteResolvedDir != "" {
+								parentDir := path.Dir(strings.TrimRight(s.remoteResolvedDir, "/"))
+								if parentDir == "" || parentDir == "." {
+									parentDir = "/"
+								}
+								upBtn := ui.ButtonBase(c).Height(22).Padding(0, 7).Radius(RadiusSM).
+									Border(1, p.BorderSubtle).AlignItems(ui.Center)
+								if upBtn.Hovered() {
+									upBtn.Background(p.BgHover)
+								}
+								upBtn.Children(func() {
+									ui.Text(c, "↑ 上级目录").FontSize(FontCaption).TextColor(p.TextSecondary)
+								})
+								if upBtn.Clicked() {
+									s.triggerBrowseRemoteDir(parentDir, updateUI)
+								}
+							}
+						})
+
+						ui.Scroll(c).MaxHeight(110).FillWidth().Children(func() {
+							ui.Row(c).FillWidth().Gap(4).Wrap().Children(func() {
+								if len(s.remoteSubdirs) == 0 {
+									ui.Text(c, "当前目录下无子文件夹，可直接点击右侧「添加」使用此目录").
+										FontSize(FontCaption).TextColor(p.TextMuted)
+								}
+								for _, sub := range s.remoteSubdirs {
+									subName := sub
+									nextPath := path.Join(s.remoteResolvedDir, subName)
+									db := ui.ButtonBase(c).Height(24).Padding(0, 8).Radius(RadiusSM).Gap(4).AlignItems(ui.Center)
+									dBg := p.BgSurface
+									if db.Hovered() {
+										dBg = p.BgHover
+									}
+									db.Background(dBg).Border(1, p.BorderSubtle).Children(func() {
+										ui.Icon(c, IconFolder).Size(11, 11).TextColor(p.TextMuted)
+										ui.Text(c, subName+"/").Font(FontMono).FontSize(FontCaption).TextColor(p.TextPrimary)
+									})
+									if db.Clicked() {
+										s.triggerBrowseRemoteDir(nextPath, updateUI)
+									}
+								}
+							})
+						})
+					})
+				}
+			}
 		})
 	})
 }
@@ -702,7 +1032,7 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 			}
 		})
 
-		policyDesc := "远程高危拦截（推荐）：在远程 SSH 服务器上拦截 rm -rf、systemctl 关停、kill -9、防火墙/数据库破坏操作以及 /etc、~/.ssh、.env 等敏感文件修改；在本地环境仅拦截 rm -rf /、mkfs、shutdown 等毁灭性命令。"
+		policyDesc := "远程高危拦截（推荐）：在远程 SSH 服务器上拦截 rm -rf、systemctl 关停、kill -9、防火墙/数据库破坏操作以及 /etc、~/.ssh、.env 等敏感文件修改（含重定向与内联脚本绕过检测）；在本地环境仅拦截 rm -rf /、mkfs、敏感系统路径写入等高危指令。"
 		accentCol := p.LocalColor
 		switch draft.SafetyPolicy {
 		case store.SafetyPolicyAlwaysHighRisk:
@@ -738,28 +1068,31 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 			})
 		}
 
-		// Active Skills discovery display (Local + Remote SSH)
+		// Active Skills discovery display (Local or Remote SSH workspace)
+		isRemoteTarget := mgr != nil && mgr.Router().Target().IsRemote
 		ui.Column(c).FillWidth().Gap(6).Padding(4, 0, 0, 0).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Text(c, fmt.Sprintf("已自动发现的 Skills (%d)", len(skills))).
+				ui.Text(c, fmt.Sprintf("当前工作区已加载的 Skills (%d)", len(skills))).
 					FontWeight(WeightMedium).FontSize(FontSmall).FontFeatures("tnum").TextColor(p.TextPrimary)
 				ui.Spacer(c)
 				ui.Text(c, ".pi/skills · ~/.pi/agent/skills").Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted)
 			})
 
 			if len(skills) == 0 {
+				hint := "当前工作区未加载自定义 SKILL.md，可在项目 .pi/skills/<name>/SKILL.md 中添加专属技能。"
+				if mgr != nil && mgr.HasUntrustedProjectSkills() {
+					hint = "检测到当前工作区存在项目级 .pi/skills，但工作区尚未标记为「已信任」，可在「工作区」页签或主界面横幅中开启信任后加载。"
+				}
 				ui.Column(c).FillWidth().Padding(12, 14).Radius(RadiusMD).
 					Background(p.BgSurface).Border(1, p.BorderSubtle).Children(func() {
-					ui.Text(c, "当前工作区未发现自定义 SKILL.md，可在项目 .pi/skills/<name>/SKILL.md 中添加专属技能。").
-						FontSize(FontSmall).LineHeight(1.5).TextColor(p.TextMuted)
+					ui.Text(c, hint).FontSize(FontSmall).LineHeight(1.5).TextColor(p.TextMuted)
 				})
 			} else {
 				for _, sk := range skills {
-					isRemoteSkill := strings.HasPrefix(sk.FilePath, "ssh://")
 					ui.Column(c).FillWidth().Padding(8, 12).Radius(RadiusMD).
 						Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(4).Children(func() {
 						ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
-							if isRemoteSkill {
+							if isRemoteTarget {
 								ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Children(func() {
 									ui.Text(c, "SSH").Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
 								})
@@ -774,6 +1107,256 @@ func (s *SettingsModal) renderSafetyAndSkillsTab(c *ui.Context, p Palette, draft
 						}
 					})
 				}
+			}
+		})
+	})
+}
+
+func (s *SettingsModal) buildCandidateMCPConfig() (store.MCPServerConfig, error) {
+	name := strings.TrimSpace(s.NewMCPName)
+	if s.NewMCPHTTP {
+		u := strings.TrimSpace(s.NewMCPURL)
+		if u == "" {
+			return store.MCPServerConfig{}, fmt.Errorf("请输入远程 MCP HTTP 接口地址 (URL)")
+		}
+		if name == "" {
+			name = "mcp-http"
+		}
+		return store.MCPServerConfig{
+			Name:        name,
+			Transport:   store.MCPTransportHTTP,
+			Enabled:     true,
+			URL:         u,
+			BearerToken: strings.TrimSpace(s.NewMCPBearer),
+		}, nil
+	}
+	cmd, args := store.ParseCommandLine(s.NewMCPCmdLine)
+	if cmd == "" {
+		return store.MCPServerConfig{}, fmt.Errorf("请输入本地 MCP 启动命令（例如 npx -y @modelcontextprotocol/server-filesystem .）")
+	}
+	if name == "" {
+		name = filepath.Base(cmd)
+	}
+	return store.MCPServerConfig{
+		Name:      name,
+		Transport: store.MCPTransportStdio,
+		Enabled:   true,
+		Command:   cmd,
+		Args:      args,
+		Env:       store.ParseKeyValuePairs(s.NewMCPEnv),
+	}, nil
+}
+
+func (s *SettingsModal) triggerProbeMCP(srv store.MCPServerConfig, mgr *harness.Manager, updateUI func(func())) {
+	if s.probingMCP {
+		return
+	}
+	s.probingMCP = true
+	s.mcpProbeNote = ""
+	s.mcpProbeError = ""
+
+	runUpdate := func(fn func()) {
+		if updateUI != nil {
+			updateUI(fn)
+		} else {
+			fn()
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+		defer cancel()
+		var st mcp.ServerStatus
+		if mgr != nil {
+			st = mgr.ProbeMCPServer(ctx, srv)
+		} else {
+			st = mcp.ProbeServer(ctx, srv, "")
+		}
+		runUpdate(func() {
+			s.probingMCP = false
+			if srv.ID != "" {
+				if s.mcpProbeCache == nil {
+					s.mcpProbeCache = map[string]mcp.ServerStatus{}
+				}
+				s.mcpProbeCache[srv.ID] = st
+			}
+			if !st.Connected {
+				s.mcpProbeError = fmt.Sprintf("MCP 连接检测失败 (%s): %s", srv.Name, st.Error)
+				return
+			}
+			var toolNames []string
+			for _, tl := range st.Tools {
+				toolNames = append(toolNames, tl.Name)
+			}
+			preview := strings.Join(toolNames, ", ")
+			if preview == "" {
+				preview = "无工具返回"
+			}
+			s.mcpProbeNote = fmt.Sprintf("✓ %s 已连接 (%dms) · 发现 %d 个工具: %s", srv.Name, st.LatencyMs, len(st.Tools), singleLinePreview(preview, 80))
+		})
+	}()
+}
+
+func (s *SettingsModal) renderMCPTab(
+	c *ui.Context,
+	p Palette,
+	draft *store.AppConfig,
+	liveCfg *store.AppConfig,
+	mgr *harness.Manager,
+	updateUI func(func()),
+	onApply func() error,
+) {
+	ui.Column(c).FillWidth().Gap(12).Children(func() {
+		ui.Text(c, "支持挂载外部 Model Context Protocol (MCP) 工具服务（Stdio 本地进程与 Streamable HTTP 远程接口），发现的工具将自动注入 Agent 上下文并纳入高危安全拦截。").
+			FontSize(FontSmall).LineHeight(1.5).TextColor(p.TextMuted)
+
+		// Existing MCP servers list
+		if len(draft.MCPServers) > 0 {
+			ui.Column(c).FillWidth().Gap(6).Children(func() {
+				for idx := range draft.MCPServers {
+					i := idx
+					ms := &draft.MCPServers[i]
+					st, hasSt := s.mcpProbeCache[ms.ID]
+
+					ui.Column(c).FillWidth().Padding(9, 12).Radius(RadiusMD).
+						Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(5).Children(func() {
+						ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+							ui.Icon(c, IconPlug).Size(14, 14).TextColor(map[bool]ui.Color{true: p.Accent, false: p.TextMuted}[ms.Enabled]).Shrink(0)
+							ui.Text(c, ms.Name).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).SingleLine()
+
+							trLabel := "STDIO"
+							trBg := p.InputBg
+							trFg := p.TextSecondary
+							if ms.Transport == store.MCPTransportHTTP {
+								trLabel = "HTTP"
+								trBg = p.SSHSoft
+								trFg = p.SSHColor
+							}
+							ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(trBg).Shrink(0).Children(func() {
+								ui.Text(c, trLabel).Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(trFg)
+							})
+
+							if ms.KeychainStored {
+								ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.LocalSoft).Shrink(0).Children(func() {
+									ui.Text(c, "Keychain").FontSize(10).TextColor(p.LocalColor)
+								})
+							}
+
+							if hasSt && ms.Enabled {
+								if st.Connected {
+									ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.LocalSoft).Shrink(0).Children(func() {
+										ui.Textf(c, "%d tools", len(st.Tools)).Font(FontMono).FontFeatures("tnum").FontSize(10).TextColor(p.LocalColor)
+									})
+								} else if st.Error != "" {
+									ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.DangerSoft).Shrink(0).
+										Tooltip(st.Error).Children(func() {
+										ui.Text(c, "连接失败").FontSize(10).TextColor(p.DangerColor)
+									})
+								}
+							}
+
+							ui.Spacer(c)
+
+							enBtn := ui.ButtonBase(c).Height(22).Padding(0, 8).Radius(RadiusSM).AlignItems(ui.Center)
+							if ms.Enabled {
+								enBtn.Background(p.AccentSoft).Children(func() {
+									ui.Text(c, "已启用").FontSize(10.5).FontWeight(WeightMedium).TextColor(p.Accent)
+								})
+							} else {
+								enBtn.Background(p.InputBg).Border(1, p.BorderSubtle).Children(func() {
+									ui.Text(c, "已停用").FontSize(10.5).TextColor(p.TextMuted)
+								})
+							}
+							if enBtn.Clicked() {
+								ms.Enabled = !ms.Enabled
+							}
+
+							IconTipBtn(c, p, IconRefresh, 24, 12.5, "检测连接并刷新工具列表", func() {
+								s.triggerProbeMCP(*ms, mgr, updateUI)
+							})
+							DangerIconBtn(c, p, IconTrash, 24, 12.5, "移除该 MCP 服务", func() {
+								removedID := draft.MCPServers[i].ID
+								_ = draft.RemoveMCPServer(removedID)
+							})
+						})
+
+						ui.Text(c, ms.DisplayEndpoint()).Font(FontMono).FontSize(FontCaption).TextColor(p.TextMuted).SingleLine().Ellipsis("...")
+					})
+				}
+			})
+		}
+
+		// Add New MCP Server Card
+		ui.Column(c).FillWidth().Padding(12, 14).Radius(RadiusMD).
+			Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(9).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "添加 MCP 工具服务").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary)
+				ui.Spacer(c)
+				AppCheckbox(c, p, &s.NewMCPHTTP, "远程 Streamable HTTP 接口", false)
+			})
+
+			ui.Row(c).FillWidth().Gap(8).Children(func() {
+				ui.TextInput(c, &s.NewMCPName).Width(170).Placeholder("服务名称 (如 github)")
+				if s.NewMCPHTTP {
+					ui.TextInput(c, &s.NewMCPURL).Grow(1).Font(FontMono).Placeholder("HTTP Endpoint (如 https://example.com/mcp)")
+				} else {
+					ui.TextInput(c, &s.NewMCPCmdLine).Grow(1).Font(FontMono).Placeholder("命令与参数 (如 npx -y @modelcontextprotocol/server-filesystem .)")
+				}
+			})
+
+			ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+				if s.NewMCPHTTP {
+					ui.TextInput(c, &s.NewMCPBearer).Grow(1).Font(FontMono).Password().Placeholder("Bearer Token 凭证 (可选，自动存入系统钥匙串)")
+				} else {
+					ui.TextInput(c, &s.NewMCPEnv).Grow(1).Font(FontMono).Placeholder("环境变量 (可选，格式 KEY=VAL;TOKEN=xxx)")
+				}
+
+				GhostBtn(c, p, IconRefresh, "测试发现", "连接该 MCP 服务并探测可用工具", func() {
+					cand, err := s.buildCandidateMCPConfig()
+					if err != nil {
+						s.mcpProbeError = err.Error()
+						return
+					}
+					s.triggerProbeMCP(cand, mgr, updateUI)
+				})
+
+				PrimaryBtn(c, p, IconPlus, "添加", "添加并启用该 MCP 服务", func() {
+					cand, err := s.buildCandidateMCPConfig()
+					if err != nil {
+						s.mcpProbeError = err.Error()
+						return
+					}
+					added := draft.UpsertMCPServer(cand)
+					_ = liveCfg.UpsertMCPServer(added)
+
+					s.NewMCPName = ""
+					s.NewMCPCmdLine = ""
+					s.NewMCPEnv = ""
+					s.NewMCPURL = ""
+					s.NewMCPBearer = ""
+					s.mcpProbeError = ""
+
+					if err := liveCfg.Save(); err != nil {
+						s.saveError = "保存 MCP 配置失败: " + err.Error()
+						c.Toast(s.saveError)
+						return
+					}
+					if onApply != nil {
+						_ = onApply()
+					}
+					c.Toast("已添加 MCP 服务: " + added.Name)
+				})
+			})
+
+			if s.probingMCP {
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Spinner(c).Size(12, 12)
+					ui.Text(c, "正在握手连接并获取 tools/list...").FontSize(FontCaption).TextColor(p.TextMuted)
+				})
+			} else if s.mcpProbeError != "" {
+				ui.Text(c, s.mcpProbeError).FontSize(FontCaption).TextColor(p.DangerColor)
+			} else if s.mcpProbeNote != "" {
+				ui.Text(c, s.mcpProbeNote).FontSize(FontCaption).TextColor(p.LocalColor)
 			}
 		})
 	})

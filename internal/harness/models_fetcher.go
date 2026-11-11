@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,191 @@ import (
 
 	"piui/internal/store"
 )
+
+// ProviderTestResult summarizes an end-to-end connectivity & authentication probe for a ProviderProfile.
+type ProviderTestResult struct {
+	LatencyMs int64
+	Endpoint  string
+	ModelID   string
+	Message   string
+}
+
+// TestProviderConnection verifies the profile's Base URL, API Key, wire protocol format,
+// and active ModelID via a minimal 1-token roundtrip (or /models probe if ModelID is unset).
+func TestProviderConnection(ctx context.Context, profile store.ProviderProfile) (*ProviderTestResult, error) {
+	start := time.Now()
+	modelID := strings.TrimSpace(profile.ModelID)
+	if modelID == "" && len(profile.Models) > 0 {
+		modelID = strings.TrimSpace(profile.Models[0])
+	}
+
+	// When no model is selected yet, verify connectivity via /v1/models discovery.
+	if modelID == "" {
+		models, err := FetchModels(ctx, profile)
+		if err != nil {
+			return nil, err
+		}
+		lat := time.Since(start).Milliseconds()
+		if lat < 1 {
+			lat = 1
+		}
+		return &ProviderTestResult{
+			LatencyMs: lat,
+			Message:   fmt.Sprintf("连接成功 (%dms) · 发现 %d 个可用模型", lat, len(models)),
+		}, nil
+	}
+
+	endpoint, payload, headers, err := buildMinimalChatProbe(profile, modelID)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("网络请求失败 (%s): %w", endpoint, err)
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	_ = resp.Body.Close()
+
+	lat := time.Since(start).Milliseconds()
+	if lat < 1 {
+		lat = 1
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet := strings.TrimSpace(string(bodyBytes))
+		if len(snippet) > 240 {
+			snippet = snippet[:240] + "..."
+		}
+		if snippet != "" {
+			return nil, fmt.Errorf("HTTP %d (%s): %s", resp.StatusCode, endpoint, snippet)
+		}
+		return nil, fmt.Errorf("HTTP %d (%s)", resp.StatusCode, endpoint)
+	}
+
+	return &ProviderTestResult{
+		LatencyMs: lat,
+		Endpoint:  endpoint,
+		ModelID:   modelID,
+		Message:   fmt.Sprintf("连接正常 (%dms) · 协议 %s · 模型 %s 验证通过", lat, profile.Format, modelID),
+	}, nil
+}
+
+func resolveProfileBaseAndKey(profile store.ProviderProfile) (base, apiKey string) {
+	base = strings.TrimSpace(profile.BaseURL)
+	if base == "" {
+		if profile.Format == store.FormatAnthropicMessages {
+			base = strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
+			if base == "" {
+				base = "https://api.anthropic.com"
+			}
+		} else {
+			base = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+			if base == "" {
+				base = "https://api.openai.com/v1"
+			}
+		}
+	}
+	base = strings.TrimRight(base, "/")
+
+	apiKey = strings.TrimSpace(profile.APIKey)
+	if apiKey == "" {
+		if profile.Format == store.FormatAnthropicMessages {
+			apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
+			if apiKey == "" {
+				apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN"))
+			}
+		} else {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+	}
+	return base, apiKey
+}
+
+func buildMinimalChatProbe(profile store.ProviderProfile, modelID string) (endpoint string, body []byte, headers map[string]string, err error) {
+	base, apiKey := resolveProfileBaseAndKey(profile)
+	if base == "" {
+		return "", nil, nil, fmt.Errorf("无效的 Base URL")
+	}
+	// Strip accidental trailing endpoint suffix if user pasted full path.
+	for _, suffix := range []string{"/chat/completions", "/completions", "/messages", "/responses"} {
+		if strings.HasSuffix(strings.ToLower(base), suffix) {
+			base = strings.TrimRight(base[:len(base)-len(suffix)], "/")
+			break
+		}
+	}
+	lower := strings.ToLower(base)
+	hasVer := strings.HasSuffix(lower, "/v1") || strings.HasSuffix(lower, "/v1beta") || strings.HasSuffix(lower, "/v2") || strings.HasSuffix(lower, "/v3") || strings.HasSuffix(lower, "/v4")
+
+	headers = map[string]string{}
+	switch profile.Format {
+	case store.FormatAnthropicMessages:
+		if hasVer {
+			endpoint = base + "/messages"
+		} else {
+			endpoint = base + "/v1/messages"
+		}
+		headers["anthropic-version"] = "2023-06-01"
+		if apiKey != "" {
+			headers["x-api-key"] = apiKey
+			headers["Authorization"] = "Bearer " + apiKey
+		}
+		body, err = json.Marshal(map[string]any{
+			"model":      modelID,
+			"max_tokens": 1,
+			"messages": []map[string]string{
+				{"role": "user", "content": "ping"},
+			},
+		})
+
+	case store.FormatOpenAIResponses:
+		if hasVer {
+			endpoint = base + "/responses"
+		} else {
+			endpoint = base + "/v1/responses"
+		}
+		if apiKey != "" {
+			headers["Authorization"] = "Bearer " + apiKey
+		}
+		body, err = json.Marshal(map[string]any{
+			"model":             modelID,
+			"input":             "ping",
+			"max_output_tokens": 16,
+		})
+
+	default:
+		if hasVer {
+			endpoint = base + "/chat/completions"
+		} else {
+			endpoint = base + "/v1/chat/completions"
+		}
+		if apiKey != "" {
+			headers["Authorization"] = "Bearer " + apiKey
+		}
+		body, err = json.Marshal(map[string]any{
+			"model":      modelID,
+			"max_tokens": 1,
+			"messages": []map[string]string{
+				{"role": "user", "content": "ping"},
+			},
+		})
+	}
+	return endpoint, body, headers, err
+}
 
 // FetchModels queries the generic OpenAI / Anthropic compatible `/models` (or `/v1/models`)
 // endpoint for the given ProviderProfile and returns the list of available model IDs.

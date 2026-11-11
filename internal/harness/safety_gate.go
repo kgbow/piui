@@ -87,9 +87,15 @@ var (
 	highRiskBashRules = []bashRiskRule{
 		{
 			level:    RiskHigh,
-			category: "递归或强制删除文件 (rm / find -delete)",
-			reason:   "命令包含 rm -r / rm -f / find -delete 强制或批量删除操作，可能导致数据不可逆丢失",
-			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)\b|find\b[^\n;&|]*\s-delete\b)`),
+			category: "递归或强制删除文件 (rm / find / xargs)",
+			reason:   "命令包含 rm -r / rm -f / find -delete / xargs rm 等批量或强制删除操作，可能导致数据不可逆丢失",
+			re:       regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)\b|find\b[^\n;&|]*\s(-delete\b|-exec(?:dir)?\s+(?:sudo\s+)?rm\b))|\|\s*(?:sudo\s+)?xargs\b[^\n;&|]*\brm\b`),
+		},
+		{
+			level:    RiskHigh,
+			category: "内联脚本破坏性文件删除",
+			reason:   "检测到通过 python / node / ruby / perl 内联脚本执行目录树或文件删除操作",
+			re:       regexp.MustCompile(`\b(shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|(?:fs\.|fsPromises\.)?(?:rmSync|rmdirSync|unlinkSync)|(?:fs|fsPromises)\.(?:rm|rmdir|unlink)|FileUtils\.rm_rf)\b`),
 		},
 		{
 			level:    RiskHigh,
@@ -210,24 +216,12 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 		}
 		sig := scope + "|bash:" + cmd
 
-		// 1. Critical rules always trigger regardless of Local vs Remote.
-		for _, rule := range criticalBashRules {
-			if rule.re.MatchString(cmd) {
-				return &RiskAssessment{
-					Level:         rule.level,
-					Category:      rule.category,
-					Reason:        rule.reason,
-					TargetSummary: truncateOneLine(cmd, 90),
-					Preview:       cmd,
-					Signature:     sig,
-				}
-			}
-		}
+		candidates := expandBashCandidatePayloads(cmd)
 
-		// 2. High-risk rules trigger on Remote SSH or when AlwaysHighRisk is active.
-		if checkHighRisk {
-			for _, rule := range highRiskBashRules {
-				if rule.re.MatchString(cmd) {
+		// 1. Critical rules & critical sensitive file mutations (/etc, ~/.ssh) always trigger regardless of Local vs Remote.
+		for _, subCmd := range candidates {
+			for _, rule := range criticalBashRules {
+				if rule.re.MatchString(subCmd) {
 					return &RiskAssessment{
 						Level:         rule.level,
 						Category:      rule.category,
@@ -235,6 +229,44 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 						TargetSummary: truncateOneLine(cmd, 90),
 						Preview:       cmd,
 						Signature:     sig,
+					}
+				}
+			}
+			if cat, reason, isCrit := detectBashSensitivePathMutation(target, subCmd); cat != "" && isCrit {
+				return &RiskAssessment{
+					Level:         RiskCritical,
+					Category:      cat,
+					Reason:        reason,
+					TargetSummary: truncateOneLine(cmd, 90),
+					Preview:       cmd,
+					Signature:     sig,
+				}
+			}
+		}
+
+		// 2. High-risk rules & non-critical sensitive file mutations (.env, crontab) trigger on Remote SSH or AlwaysHighRisk.
+		if checkHighRisk {
+			for _, subCmd := range candidates {
+				if cat, reason, _ := detectBashSensitivePathMutation(target, subCmd); cat != "" {
+					return &RiskAssessment{
+						Level:         RiskHigh,
+						Category:      cat,
+						Reason:        reason,
+						TargetSummary: truncateOneLine(cmd, 90),
+						Preview:       cmd,
+						Signature:     sig,
+					}
+				}
+				for _, rule := range highRiskBashRules {
+					if rule.re.MatchString(subCmd) {
+						return &RiskAssessment{
+							Level:         rule.level,
+							Category:      rule.category,
+							Reason:        rule.reason,
+							TargetSummary: truncateOneLine(cmd, 90),
+							Preview:       cmd,
+							Signature:     sig,
+						}
 					}
 				}
 			}
@@ -300,6 +332,38 @@ func AssessToolCallRisk(target store.WorkspaceTarget, policy store.SafetyPolicy,
 				Signature:     sig,
 			}
 		}
+
+	default:
+		if strings.HasPrefix(toolName, "mcp__") {
+			lowerName := strings.ToLower(toolName)
+			isDestructiveMCP := false
+			for _, kw := range []string{"delete", "remove", "drop", "destroy", "truncate", "kill", "terminate", "exec", "write_file", "run_command"} {
+				if strings.Contains(lowerName, kw) {
+					isDestructiveMCP = true
+					break
+				}
+			}
+			if (isDestructiveMCP && checkHighRisk) || strictRemote {
+				preview := fmt.Sprintf("MCP 工具: %s\n参数: %v", toolName, args)
+				sig := scope + "|" + toolName
+				lvl := RiskSensitive
+				cat := "外部 MCP 工具执行确认"
+				reason := "当前安全策略要求对外部 MCP 扩展工具调用进行人工确认"
+				if isDestructiveMCP {
+					lvl = RiskHigh
+					cat = "高危 MCP 变更操作确认"
+					reason = fmt.Sprintf("检测到外部 MCP 工具 %q 包含删除、写入或命令执行动作", toolName)
+				}
+				return &RiskAssessment{
+					Level:         lvl,
+					Category:      cat,
+					Reason:        reason,
+					TargetSummary: toolName,
+					Preview:       preview,
+					Signature:     sig,
+				}
+			}
+		}
 	}
 
 	return nil
@@ -323,6 +387,162 @@ func matchSensitiveFilePath(p string) (category, reason string, critical bool) {
 		return "敏感环境变量文件 (.env) 修改", fmt.Sprintf("目标路径 %q 包含环境密钥或敏感配置", p), false
 	}
 	return "", "", false
+}
+
+var (
+	nestedShellSingleQuoteRe = regexp.MustCompile(`(?:^|[;&|\n(]\s*)(?:sudo\s+)?(?:(?:/usr)?/bin/)?(?:ba|z|da|k)?sh\s+-[a-zA-Z]*c\s+'([^']+)'`)
+	nestedShellDoubleQuoteRe = regexp.MustCompile(`(?:^|[;&|\n(]\s*)(?:sudo\s+)?(?:(?:/usr)?/bin/)?(?:ba|z|da|k)?sh\s+-[a-zA-Z]*c\s+"((?:\\.|[^"\\])+)"`)
+	evalQuoteRe              = regexp.MustCompile(`(?:^|[;&|\n(]\s*)(?:sudo\s+)?eval\s+['"]([^'"]+)['"]`)
+	bashRedirectTargetRe     = regexp.MustCompile(`(?:^|[^0-9<>])(?:[12&]?>|[12]?>>|>\|)\s*(['"]?[^'"\s;&|()<>]+['"]?)`)
+	bashTeeTargetRe          = regexp.MustCompile(`(?:^|[|;&\n]\s*)(?:sudo\s+)?tee\b([^\n|;&]*)`)
+	bashMutatorSegmentRe     = regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:sudo\s+)?(cp|mv|install|ln|rm|unlink|shred|truncate|chmod|chown|chgrp|sed|perl|dd)\b([^\n;&|]*)`)
+)
+
+// expandBashCandidatePayloads returns cmd plus any inner command strings passed to `sh -c`,
+// `bash -lc`, or `eval`, preventing nested shell wrappers from bypassing boundary regexes.
+func expandBashCandidatePayloads(cmd string) []string {
+	out := []string{cmd}
+	seen := map[string]bool{cmd: true}
+	queue := []string{cmd}
+
+	for depth := 0; depth < 3 && len(queue) > 0; depth++ {
+		var next []string
+		for _, cur := range queue {
+			for _, re := range []*regexp.Regexp{nestedShellSingleQuoteRe, nestedShellDoubleQuoteRe, evalQuoteRe} {
+				for _, m := range re.FindAllStringSubmatch(cur, -1) {
+					if len(m) < 2 {
+						continue
+					}
+					inner := strings.TrimSpace(strings.ReplaceAll(m[1], `\"`, `"`))
+					if inner != "" && !seen[inner] {
+						seen[inner] = true
+						out = append(out, inner)
+						next = append(next, inner)
+					}
+				}
+			}
+		}
+		queue = next
+	}
+	return out
+}
+
+func resolveCandidateTargetPath(target store.WorkspaceTarget, rawToken string) string {
+	tok := strings.Trim(strings.TrimSpace(rawToken), `"'`)
+	if tok == "" || strings.HasPrefix(tok, "&") || tok == "/dev/null" || tok == "/dev/stdout" || tok == "/dev/stderr" {
+		return ""
+	}
+	if strings.HasPrefix(tok, "$HOME/") {
+		tok = "~/" + strings.TrimPrefix(tok, "$HOME/")
+	} else if strings.HasPrefix(tok, "${HOME}/") {
+		tok = "~/" + strings.TrimPrefix(tok, "${HOME}/")
+	}
+	if target.IsRemote {
+		return resolveRemotePath(target.WorkDir, tok)
+	}
+	expanded := store.ExpandLocalPath(tok)
+	if !filepath.IsAbs(expanded) && !strings.HasPrefix(expanded, "/") && !strings.HasPrefix(expanded, "~/") && target.WorkDir != "" {
+		expanded = filepath.Join(store.ExpandLocalPath(target.WorkDir), expanded)
+	}
+	return filepath.ToSlash(expanded)
+}
+
+// detectBashSensitivePathMutation checks whether a bash command writes, redirects, overwrites,
+// moves, deletes, or alters permissions on sensitive system/credential paths (/etc, ~/.ssh, .env).
+func detectBashSensitivePathMutation(target store.WorkspaceTarget, cmd string) (category, reason string, critical bool) {
+	var candidatePaths []string
+
+	// 1. Shell output redirections (>, >>, &>, >|)
+	for _, m := range bashRedirectTargetRe.FindAllStringSubmatch(cmd, -1) {
+		if len(m) >= 2 {
+			candidatePaths = append(candidatePaths, m[1])
+		}
+	}
+
+	// 2. `tee` targets (e.g. echo ... | sudo tee -a /etc/hosts)
+	for _, m := range bashTeeTargetRe.FindAllStringSubmatch(cmd, -1) {
+		if len(m) >= 2 {
+			for _, field := range strings.Fields(m[1]) {
+				if !strings.HasPrefix(field, "-") {
+					candidatePaths = append(candidatePaths, field)
+				}
+			}
+		}
+	}
+
+	// 3. Mutating file utilities (cp, mv, rm, chmod, sed -i, dd of=...)
+	for _, m := range bashMutatorSegmentRe.FindAllStringSubmatch(cmd, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		bin := m[1]
+		fields := strings.Fields(m[2])
+		switch bin {
+		case "sed", "perl":
+			inPlace := false
+			for _, f := range fields {
+				if f == "-i" || strings.HasPrefix(f, "-i") || strings.HasPrefix(f, "--in-place") {
+					inPlace = true
+					break
+				}
+			}
+			if !inPlace {
+				continue
+			}
+			for _, f := range fields {
+				if !strings.HasPrefix(f, "-") && !strings.Contains(f, "/") && strings.HasPrefix(f, "'") {
+					continue
+				}
+				if !strings.HasPrefix(f, "-") {
+					candidatePaths = append(candidatePaths, f)
+				}
+			}
+		case "dd":
+			for _, f := range fields {
+				if strings.HasPrefix(f, "of=") {
+					candidatePaths = append(candidatePaths, strings.TrimPrefix(f, "of="))
+				}
+			}
+		case "cp", "mv", "install", "ln":
+			var nonFlags []string
+			for _, f := range fields {
+				if !strings.HasPrefix(f, "-") {
+					nonFlags = append(nonFlags, f)
+				}
+			}
+			// For cp/mv/install/ln, the destination (last argument) is mutated; for mv, source is also removed!
+			if bin == "mv" {
+				candidatePaths = append(candidatePaths, nonFlags...)
+			} else if len(nonFlags) > 0 {
+				candidatePaths = append(candidatePaths, nonFlags[len(nonFlags)-1])
+			}
+		default:
+			for _, f := range fields {
+				if !strings.HasPrefix(f, "-") {
+					candidatePaths = append(candidatePaths, f)
+				}
+			}
+		}
+	}
+
+	var bestCat, bestReason string
+	for _, rawP := range candidatePaths {
+		resolved := resolveCandidateTargetPath(target, rawP)
+		if resolved == "" {
+			continue
+		}
+		cat, rsn, crit := matchSensitiveFilePath(resolved)
+		if cat != "" {
+			if crit {
+				return cat + " (Bash)", rsn, true
+			}
+			if bestCat == "" {
+				bestCat = cat + " (Bash)"
+				bestReason = rsn
+			}
+		}
+	}
+	return bestCat, bestReason, false
 }
 
 // isReadOnlyBashCommand conservatively determines whether cmd is a single, provably

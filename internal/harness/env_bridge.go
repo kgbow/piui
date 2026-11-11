@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -33,6 +34,7 @@ type EnvironmentRouter struct {
 	switched      bool
 	onTermChunk   TerminalStreamSink
 	pinnedTargets map[string]store.WorkspaceTarget
+	changes       *ChangeTracker
 }
 
 // NewEnvironmentRouter creates a router bound to an initial WorkspaceTarget.
@@ -44,7 +46,13 @@ func NewEnvironmentRouter(initial store.WorkspaceTarget, sink TerminalStreamSink
 		target:        initial,
 		onTermChunk:   sink,
 		pinnedTargets: map[string]store.WorkspaceTarget{},
+		changes:       NewChangeTracker(),
 	}
+}
+
+// Changes returns the file mutation snapshot tracker for diff rendering and one-click rollback.
+func (r *EnvironmentRouter) Changes() *ChangeTracker {
+	return r.changes
 }
 
 // SetTarget hot-swaps the active execution target mid-session.
@@ -68,6 +76,30 @@ func (r *EnvironmentRouter) SetTarget(t store.WorkspaceTarget) {
 		}
 		r.onTermChunk(fmt.Sprintf("\n─── [Target Switched → %s : %s] ───\n", mode, loc))
 	}
+}
+
+// SetTargetQuiet binds the router to a new workspace target at a clean session boundary
+// without emitting a mid-conversation switch notice.
+func (r *EnvironmentRouter) SetTargetQuiet(t store.WorkspaceTarget) {
+	if !t.IsRemote && t.WorkDir != "" {
+		t.WorkDir = store.ExpandLocalPath(t.WorkDir)
+	}
+	r.mu.Lock()
+	r.target = t
+	r.switched = false
+	r.pinnedTargets = map[string]store.WorkspaceTarget{}
+	r.mu.Unlock()
+}
+
+// UpdateTargetMetadata updates non-routing metadata (such as Trusted or Name) on the active target
+// without triggering a target-switch prompt notice.
+func (r *EnvironmentRouter) UpdateTargetMetadata(t store.WorkspaceTarget) {
+	if !t.IsRemote && t.WorkDir != "" {
+		t.WorkDir = store.ExpandLocalPath(t.WorkDir)
+	}
+	r.mu.Lock()
+	r.target = t
+	r.mu.Unlock()
 }
 
 // Target returns the currently active WorkspaceTarget.
@@ -199,15 +231,54 @@ func (r *EnvironmentRouter) wrapFileTool(name string, schemaTemplate agent.Agent
 				params = prepared
 			}
 		}
+
+		trackMutation := (name == "edit" || name == "write") && id != "" && r.changes != nil
+		var (
+			resolvedPath string
+			displayPath  string
+			existed      bool
+			beforeBytes  []byte
+			beforeOK     bool
+		)
+		if trackMutation {
+			rawPath, _ := params["path"].(string)
+			resolvedPath, displayPath, existed, beforeBytes, beforeOK = CaptureFileState(ctx, target, target.WorkDir, rawPath)
+		}
+
+		var (
+			res agent.AgentToolResult
+			err error
+		)
 		if !target.IsRemote {
 			localCwd := store.ExpandLocalPath(target.WorkDir)
-			localTool, err := coding.CreateTool(name, localCwd)
-			if err != nil {
-				return agent.AgentToolResult{}, err
+			localTool, toolErr := coding.CreateTool(name, localCwd)
+			if toolErr != nil {
+				return agent.AgentToolResult{}, toolErr
 			}
-			return localTool.Execute(ctx, id, params, onUpdate)
+			res, err = localTool.Execute(ctx, id, params, onUpdate)
+		} else {
+			res, err = r.execRemoteFileTool(ctx, target, name, params)
 		}
-		return r.execRemoteFileTool(ctx, target, name, params)
+
+		if err == nil && beforeOK {
+			var afterBytes []byte
+			afterOK := false
+			if name == "write" {
+				if contentStr, ok := params["content"].(string); ok && len(contentStr) <= maxTrackedMutationBytes {
+					afterBytes = []byte(contentStr)
+					afterOK = true
+				}
+			}
+			if !afterOK {
+				rawPath, _ := params["path"].(string)
+				_, _, _, afterBytes, afterOK = CaptureFileState(ctx, target, target.WorkDir, rawPath)
+			}
+			if afterOK {
+				snap := BuildMutationSnapshot(id, name, target, resolvedPath, displayPath, existed, beforeBytes, afterBytes)
+				r.changes.Record(snap)
+			}
+		}
+		return res, err
 	}
 	return t
 }
@@ -271,6 +342,48 @@ func (r *EnvironmentRouter) wrapBashTool(schemaTemplate agent.AgentTool) agent.A
 	return t
 }
 
+// ExecDirectBash executes an explicit user "! <command>" shell command on the active Local or Remote SSH
+// workspace, streaming live partial output via onUpdate and returning final combined output + duration.
+func (r *EnvironmentRouter) ExecDirectBash(ctx context.Context, command string, onUpdate func(partial string)) (string, int64, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "", 0, nil
+	}
+	target := r.Target()
+	localCwd := target.WorkDir
+	if !target.IsRemote {
+		localCwd = store.ExpandLocalPath(localCwd)
+	}
+
+	var baseOps coding.BashOperations
+	if target.IsRemote {
+		baseOps = r.sshBashOperations(target)
+	} else {
+		baseOps = coding.LocalBashOperations(coding.LocalBashOptions{})
+	}
+
+	startedAt := time.Now()
+	tool := coding.CreateBashTool(localCwd, &coding.BashToolOptions{
+		Operations: &baseOps,
+	})
+	res, err := tool.Execute(ctx, fmt.Sprintf("direct-%d", startedAt.UnixNano()), map[string]any{
+		"command": command,
+	}, func(partial agent.AgentToolResult) {
+		if onUpdate != nil {
+			txt := ai.ContentText(partial.Content, "\n")
+			if txt != "" {
+				onUpdate(txt)
+			}
+		}
+	})
+	durMs := max(int64(1), time.Since(startedAt).Milliseconds())
+	out := ai.ContentText(res.Content, "\n")
+	if err != nil && out == "" {
+		out = err.Error()
+	}
+	return out, durMs, err
+}
+
 // sshBashOperations executes bash commands on a remote host via local ssh client
 // (automatically honoring ~/.ssh/config, ProxyJump, Tailscale, and ssh-agent).
 func (r *EnvironmentRouter) sshBashOperations(target store.WorkspaceTarget) coding.BashOperations {
@@ -288,14 +401,47 @@ func (r *EnvironmentRouter) sshBashOperations(target store.WorkspaceTarget) codi
 			if cwd != "" && cwd != "~" {
 				remoteScript = fmt.Sprintf("cd -- %s && {\n%s\n}", shellQuotePath(cwd), command)
 			}
+			managedScript := wrapRemoteManagedProcessScript(remoteScript)
 
-			args := sshBashArgs(target.SSHHost, true, remoteScript)
+			stdinR, stdinW, pipeErr := os.Pipe()
+			if pipeErr == nil {
+				defer func() {
+					_ = stdinW.Close()
+					_ = stdinR.Close()
+				}()
+			}
+
+			args := sshBashArgs(target.SSHHost, true, managedScript)
 			cmd := exec.CommandContext(execCtx, sshBinary, args...)
+			if pipeErr == nil {
+				cmd.Stdin = stdinR
+			}
+			cmd.WaitDelay = 500 * time.Millisecond
 			stream := &chunkWriter{onData: options.OnData}
 			cmd.Stdout = stream
 			cmd.Stderr = stream
 
-			err := cmd.Run()
+			err := cmd.Start()
+			if pipeErr == nil {
+				_ = stdinR.Close()
+			}
+			if err == nil {
+				doneWatch := make(chan struct{})
+				if pipeErr == nil {
+					go func() {
+						select {
+						case <-execCtx.Done():
+							_ = stdinW.Close()
+						case <-doneWatch:
+						}
+					}()
+				}
+				err = cmd.Wait()
+				close(doneWatch)
+			}
+			if pipeErr == nil {
+				_ = stdinW.Close()
+			}
 			if ctx.Err() != nil {
 				return nil, coding.ErrShellAborted
 			}

@@ -12,13 +12,15 @@ import (
 )
 
 // SavedSessionSummary enriches coding.SessionInfo with a human-readable conversation title
-// extracted from the first user prompt in the JSONL file.
+// extracted from the first user prompt in the JSONL file and compact relative age metadata.
 type SavedSessionSummary struct {
-	ID        string
-	Path      string
-	Title     string
-	Timestamp string
-	Messages  int
+	ID           string
+	Path         string
+	Title        string
+	Timestamp    string
+	RelativeTime string
+	UpdatedAt    time.Time
+	Messages     int
 }
 
 // ProjectedTurnMessage pairs a reconstructed AgentMessage with its JSONL tree provenance
@@ -468,4 +470,29 @@ func FormatSessionTimestamp(ts string) string {
 		return strings.ReplaceAll(ts[:16], "T", " ")
 	}
 	return ts
+}
+
+// FormatRelativeAge formats t relative to now using compact sidebar units ("now", "4m", "21h", "2d", "3mo", "1y").
+func FormatRelativeAge(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := now.Sub(t)
+	if d < time.Minute {
+		return "now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	days := int(d / (24 * time.Hour))
+	if days < 30 {
+		return fmt.Sprintf("%dd", days)
+	}
+	if days < 365 {
+		return fmt.Sprintf("%dmo", max(days/30, 1))
+	}
+	return fmt.Sprintf("%dy", max(days/365, 1))
 }

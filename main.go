@@ -7,19 +7,39 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
+	"piui/internal/diag"
+	"piui/internal/store"
+	"piui/internal/sysenv"
 	deskui "piui/internal/ui"
 )
 
 func main() {
-	workDir, err := os.Getwd()
-	if err != nil {
-		workDir = "."
+	_ = diag.Init()
+	defer func() {
+		diag.CapturePanic("main", nil)
+		_ = diag.Close()
+	}()
+
+	// Hydrate PATH & developer tool environment when launched as a GUI .app bundle.
+	sysenv.HydrateLoginEnvironment()
+
+	// Store API keys in OS Keychain / Credential Manager instead of plaintext JSON.
+	if os.Getenv("PIUI_DISABLE_KEYCHAIN") != "1" {
+		store.SetSecretStore(store.NewSystemKeychainStore())
 	}
 
-	app, err := deskui.NewDeskApp(workDir)
+	workDir, explicitDir := sysenv.ResolveStartupWorkDir(os.Args[1:])
+
+	app, err := deskui.NewDeskAppWithOptions(store.LoadOptions{
+		StartupDir:         workDir,
+		ExplicitStartupDir: explicitDir,
+	})
 	if err != nil {
 		log.Fatalf("failed to initialize PiUI DeskApp: %v", err)
 	}
+	defer func() {
+		_ = app.Close()
+	}()
 
 	mygo.App.WhenReady(func() {
 		win := mygo.NewWindow(mygo.WindowOptions{

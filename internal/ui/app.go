@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 	"github.com/egoist/mygo/ui/markdown"
 	"github.com/sky-valley/pi/agent"
@@ -31,44 +33,75 @@ type DeskApp struct {
 	mdOpts           markdown.Options
 	mdThemeLight     *bool
 
-	// Composer & run state
-	input            string
-	isRunning        bool
-	activeToolStatus string
-	lastError        string
-	cancelRun        context.CancelFunc
+	// Composer, @file autocomplete, multimodal attachments & run state
+	input                string
+	pendingAttachments   []PendingAttachment
+	nextAttachID         int
+	pickingAttachment    bool
+	indexingFiles        bool
+	atSelectedIdx        int
+	atDismissedToken     string
+	isRunning            bool
+	isCompacting         bool
+	activeToolStatus     string
+	lastError            string
+	cancelRun            context.CancelFunc
+	trustBannerDismissed bool
 
-	// Sidebars, Split Panes, Session Branch Tree & Modals
-	sidebarWidth     float32
-	sidebarCollapsed bool
-	sidebarTab       int // 0 = 会话历史 (.jsonl), 1 = 分支树 (Session Tree)
-	savedSessions    []harness.SavedSessionSummary
-	activeSessID     string
-	treeSnap         *harness.SessionTreeSnapshot
-	termDrawer       *TermDrawer
-	settingsModal    SettingsModal
-	approvalModal    ApprovalModal
+	// Sidebars, Split Panes, Workspace -> Session Tree, Session Branch Popover & Modals
+	sidebarWidth        float32
+	sidebarCollapsed    bool
+	savedSessions       []harness.SavedSessionSummary
+	workspaceSessions   map[string][]harness.SavedSessionSummary
+	collapsedWorkspaces map[string]bool
+	expandedAllSessions map[string]bool
+	sidebarSearchOpen   bool
+	sessionSearch       string
+	renamingSessID      string
+	renameDraft         string
+	activeSessID        string
+	treeSnap            *harness.SessionTreeSnapshot
+	branchPopoverOpen   bool
+	probingGit          bool
+	gitPopoverOpen      bool
+	ctxPopoverOpen      bool
+	settingsModal       SettingsModal
+	approvalModal       ApprovalModal
+	cmdPalette          CommandPaletteModal
 }
 
-// NewDeskApp initializes the application state, config, and sky-valley/pi harness.
+// NewDeskApp initializes the application state, config, and sky-valley/pi harness for workDir.
 func NewDeskApp(workDir string) (*DeskApp, error) {
-	cfg := store.LoadOrInit(workDir)
+	return NewDeskAppWithOptions(store.LoadOptions{
+		StartupDir:         workDir,
+		ExplicitStartupDir: strings.TrimSpace(workDir) != "",
+	})
+}
+
+// NewDeskAppWithOptions initializes DeskApp honoring CLI vs GUI desktop launch semantics.
+func NewDeskAppWithOptions(opts store.LoadOptions) (*DeskApp, error) {
+	cfg := store.LoadOrInitWithOptions(opts)
+	baseDir := strings.TrimSpace(opts.StartupDir)
+	if baseDir == "" {
+		if t := cfg.ActiveTarget(); t != nil && !t.IsRemote && t.WorkDir != "" {
+			baseDir = t.WorkDir
+		}
+	}
+
 	app := &DeskApp{
-		cfg:          cfg,
-		toolCards:    map[string]*ChatEntry{},
-		sidebarWidth: DefaultSidebarWidth,
-		termDrawer:   NewTermDrawer(),
+		cfg:                 cfg,
+		toolCards:           map[string]*ChatEntry{},
+		sidebarWidth:        DefaultSidebarWidth,
+		workspaceSessions:   map[string][]harness.SavedSessionSummary{},
+		collapsedWorkspaces: map[string]bool{},
+		expandedAllSessions: map[string]bool{},
 	}
 	app.mdOpts.Reveal = &markdown.Reveal{Unit: markdown.ByWord}
 
 	mgr, err := harness.NewManager(
-		workDir,
+		baseDir,
 		cfg,
-		func(chunk string) {
-			app.updateUI(func() {
-				app.termDrawer.AppendChunk(chunk)
-			})
-		},
+		nil,
 		app.handleAgentEvent,
 	)
 	if err != nil {
@@ -95,9 +128,28 @@ func NewDeskApp(workDir string) (*DeskApp, error) {
 	return app, nil
 }
 
-// BindWindow attaches the native MyGo window handle once ready.
+// Close cancels any active agent run and cleanly flushes/closes session persistence.
+func (a *DeskApp) Close() error {
+	if a.cancelRun != nil {
+		a.cancelRun()
+	}
+	if a.mgr != nil {
+		a.mgr.Abort()
+		return a.mgr.Close()
+	}
+	return nil
+}
+
+// BindWindow attaches the native MyGo window handle once ready and triggers background SSH/Git/file checks.
 func (a *DeskApp) BindWindow(w *mygo.Window) {
 	a.win = w
+	if a.mgr != nil {
+		if a.mgr.Router().Target().IsRemote {
+			a.probeActiveSSHAsync(false)
+		}
+		a.refreshGitStatusAsync()
+		a.ensureWorkspaceFilesIndexed()
+	}
 }
 
 func (a *DeskApp) updateUI(fn func()) {
@@ -106,6 +158,23 @@ func (a *DeskApp) updateUI(fn func()) {
 	} else {
 		fn()
 	}
+}
+
+func (a *DeskApp) probeActiveSSHAsync(reconnect bool) {
+	if a.mgr == nil {
+		return
+	}
+	t := a.mgr.Router().Target()
+	if !t.IsRemote || strings.TrimSpace(t.SSHHost) == "" {
+		return
+	}
+	a.mgr.SetSSHChecking(t.SSHHost)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = a.mgr.RefreshSSHWorkspace(ctx, reconnect)
+		a.updateUI(func() {})
+	}()
 }
 
 func (a *DeskApp) allocID() int {
@@ -151,12 +220,274 @@ func (a *DeskApp) applyProfileOrWarn(c *ui.Context, prof *store.ProviderProfile)
 }
 
 func (a *DeskApp) refreshSessionsList() {
-	if a.mgr != nil {
-		a.savedSessions = a.mgr.ListSavedSessionSummaries()
-		a.treeSnap = a.mgr.SessionTreeSnapshot()
-		if a.activeSessID == "" && a.treeSnap != nil {
-			a.activeSessID = a.treeSnap.SessionID
+	if a.mgr == nil {
+		return
+	}
+	var titles map[string]string
+	if a.cfg != nil {
+		titles = a.cfg.SessionTitles
+	}
+	if a.workspaceSessions == nil {
+		a.workspaceSessions = map[string][]harness.SavedSessionSummary{}
+	} else {
+		clear(a.workspaceSessions)
+	}
+
+	activeTarget := a.mgr.Router().Target()
+	if a.cfg != nil {
+		for _, wt := range a.cfg.Targets {
+			list := a.mgr.ListWorkspaceSessionSummaries(wt, titles)
+			a.workspaceSessions[wt.ID] = list
+			if wt.ID == activeTarget.ID {
+				a.savedSessions = list
+			}
 		}
+	}
+	if _, ok := a.workspaceSessions[activeTarget.ID]; !ok {
+		list := a.mgr.ListWorkspaceSessionSummaries(activeTarget, titles)
+		a.workspaceSessions[activeTarget.ID] = list
+		a.savedSessions = list
+	}
+
+	a.treeSnap = a.mgr.SessionTreeSnapshot()
+	if a.activeSessID == "" && a.treeSnap != nil {
+		a.activeSessID = a.treeSnap.SessionID
+	}
+}
+
+// OpenWorkspaceSession loads a saved JSONL session, automatically switching the active workspace
+// first if the clicked session belongs to a different Local or Remote SSH workspace.
+func (a *DeskApp) OpenWorkspaceSession(c *ui.Context, wt store.WorkspaceTarget, sessInfo harness.SavedSessionSummary) {
+	if a.isRunning || a.mgr == nil || a.approvalModal.PendingCount() > 0 {
+		return
+	}
+
+	cur := a.mgr.Router().Target()
+	sameWorkspace := cur.ID == wt.ID && cur.SameLocation(wt)
+	if sameWorkspace {
+		projected, snap, err := a.mgr.ResumeSavedSessionProjected(sessInfo.Path, a.cfg.ActiveProfile())
+		if err != nil {
+			a.lastError = err.Error()
+			if c != nil {
+				c.Toast(a.lastError)
+			}
+			return
+		}
+		a.toolCards = map[string]*ChatEntry{}
+		a.currentAssistant = nil
+		a.lastUserEntry = nil
+		a.branchPopoverOpen = false
+		a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
+		a.activeSessID = sessInfo.ID
+		a.treeSnap = snap
+		a.lastError = ""
+		if c != nil {
+			c.Toast("已加载历史会话: " + sessInfo.Title)
+		}
+		return
+	}
+
+	a.cfg.ActiveTargetID = wt.ID
+	projected, snap, err := a.mgr.SwitchWorkspaceAndResumeSession(wt, sessInfo.Path, a.cfg.ActiveProfile())
+	if err != nil {
+		a.lastError = "切换工作区并加载会话失败: " + err.Error()
+		if c != nil {
+			c.Toast(a.lastError)
+		}
+		return
+	}
+
+	a.toolCards = map[string]*ChatEntry{}
+	a.currentAssistant = nil
+	a.lastUserEntry = nil
+	a.pendingAttachments = nil
+	a.atSelectedIdx = 0
+	a.atDismissedToken = ""
+	a.gitPopoverOpen = false
+	a.ctxPopoverOpen = false
+	a.branchPopoverOpen = false
+	a.renamingSessID = ""
+	a.trustBannerDismissed = false
+	a.approvalModal.Clear()
+	a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
+	a.activeSessID = sessInfo.ID
+	a.treeSnap = snap
+	a.lastError = a.mgr.RecorderWarning()
+	a.refreshSessionsList()
+
+	if a.win != nil {
+		if wt.IsRemote {
+			a.probeActiveSSHAsync(false)
+		}
+		a.refreshGitStatusAsync()
+		a.ensureWorkspaceFilesIndexed()
+	}
+	if a.saveConfigOrWarn(c) && c != nil {
+		c.Toast(fmt.Sprintf("已切换至 %s · %s", wt.ShortName(), sessInfo.Title))
+	}
+}
+
+func (a *DeskApp) triggerQuickAddLocalWorkspace() {
+	if a.win == nil {
+		a.settingsModal.NewTargetRemote = false
+		a.settingsModal.ActiveTab = 1
+		a.settingsModal.Open = true
+		return
+	}
+	go func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent:            a.win,
+			Title:             "选择本地项目目录",
+			Directory:         true,
+			CreateDirectories: true,
+		})
+		if err != nil || len(paths) == 0 {
+			return
+		}
+		picked := strings.TrimSpace(paths[0])
+		if picked == "" {
+			return
+		}
+		a.updateUI(func() {
+			added := a.cfg.UpsertLocalTarget(picked, "", false)
+			_ = a.cfg.Save()
+			a.refreshSessionsList()
+			if !a.isRunning && a.approvalModal.PendingCount() == 0 {
+				a.SwitchWorkspace(nil, added)
+			}
+		})
+	}()
+}
+
+// SwitchWorkspace transitions the UI and Manager to a Local or Remote SSH workspace,
+// isolating conversation history and context to that workspace.
+func (a *DeskApp) SwitchWorkspace(c *ui.Context, wt store.WorkspaceTarget) {
+	if a.isRunning || a.mgr == nil || a.approvalModal.PendingCount() > 0 {
+		return
+	}
+	cur := a.mgr.Router().Target()
+	if cur.ID == wt.ID && cur.SameLocation(wt) {
+		return
+	}
+
+	a.cfg.ActiveTargetID = wt.ID
+	if err := a.mgr.SwitchWorkspace(wt, a.cfg.ActiveProfile()); err != nil {
+		a.lastError = "切换工作区失败: " + err.Error()
+		if c != nil {
+			c.Toast(a.lastError)
+		}
+		return
+	}
+
+	a.entries = nil
+	a.toolCards = map[string]*ChatEntry{}
+	a.currentAssistant = nil
+	a.lastUserEntry = nil
+	a.pendingAttachments = nil
+	a.atSelectedIdx = 0
+	a.atDismissedToken = ""
+	a.gitPopoverOpen = false
+	a.ctxPopoverOpen = false
+	a.branchPopoverOpen = false
+	a.activeSessID = ""
+	a.treeSnap = nil
+	a.renamingSessID = ""
+	a.trustBannerDismissed = false
+	a.approvalModal.Clear()
+	a.lastError = a.mgr.RecorderWarning()
+	a.refreshSessionsList()
+
+	if a.win != nil {
+		if wt.IsRemote {
+			a.probeActiveSSHAsync(false)
+		}
+		a.refreshGitStatusAsync()
+		a.ensureWorkspaceFilesIndexed()
+	}
+	if a.saveConfigOrWarn(c) && c != nil {
+		c.Toast("已切换至工作区: " + wt.ShortName())
+	}
+}
+
+// TrustActiveWorkspace marks the active workspace as trusted so project-scoped .pi/skills
+// and remote AGENTS.md are loaded into the Agent's system prompt.
+func (a *DeskApp) TrustActiveWorkspace(c *ui.Context) {
+	if a.mgr == nil {
+		return
+	}
+	t := a.mgr.Router().Target()
+	a.cfg.SetTargetTrusted(t.ID, true)
+	a.trustBannerDismissed = false
+	_ = a.saveConfigOrWarn(c)
+
+	if t.IsRemote {
+		t.Trusted = true
+		a.mgr.Router().UpdateTargetMetadata(t)
+		if a.win != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				a.mgr.SetWorkspaceTrust(ctx, true)
+				a.updateUI(func() {})
+			}()
+		} else {
+			a.mgr.SetWorkspaceTrust(context.Background(), true)
+		}
+	} else {
+		a.mgr.SetWorkspaceTrust(context.Background(), true)
+	}
+	if c != nil {
+		c.Toast("已信任当前工作区，项目级 Skills 与指令将在下一轮对话生效")
+	}
+}
+
+// RenameSession saves a custom display title for a session ID (empty string restores default auto-title).
+func (a *DeskApp) RenameSession(c *ui.Context, sessionID, newTitle string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	a.cfg.SetSessionTitle(sessionID, newTitle)
+	a.renamingSessID = ""
+	a.renameDraft = ""
+	_ = a.saveConfigOrWarn(c)
+	a.refreshSessionsList()
+	if c != nil {
+		c.Toast("已更新会话标题")
+	}
+}
+
+// DeleteSession deletes a saved JSONL session from disk and resets the timeline if it was active.
+func (a *DeskApp) DeleteSession(c *ui.Context, sessInfo harness.SavedSessionSummary) {
+	if a.isRunning || a.mgr == nil {
+		return
+	}
+	wasActive, err := a.mgr.DeleteSavedSession(sessInfo.Path, a.cfg.ActiveProfile())
+	if err != nil {
+		a.lastError = "删除会话失败: " + err.Error()
+		if c != nil {
+			c.Toast(a.lastError)
+		}
+		return
+	}
+	a.cfg.DeleteSessionTitle(sessInfo.ID)
+	_ = a.saveConfigOrWarn(nil)
+
+	if wasActive || a.activeSessID == sessInfo.ID {
+		a.entries = nil
+		a.toolCards = map[string]*ChatEntry{}
+		a.currentAssistant = nil
+		a.lastUserEntry = nil
+		a.activeSessID = ""
+		a.treeSnap = nil
+	}
+	if a.renamingSessID == sessInfo.ID {
+		a.renamingSessID = ""
+		a.renameDraft = ""
+	}
+	a.refreshSessionsList()
+	if c != nil {
+		c.Toast("已删除会话: " + sessInfo.Title)
 	}
 }
 
@@ -175,8 +506,14 @@ func (a *DeskApp) startNewSession(c *ui.Context) {
 	a.toolCards = map[string]*ChatEntry{}
 	a.currentAssistant = nil
 	a.lastUserEntry = nil
+	a.pendingAttachments = nil
+	a.atSelectedIdx = 0
+	a.atDismissedToken = ""
+	a.ctxPopoverOpen = false
+	a.branchPopoverOpen = false
 	a.activeSessID = ""
 	a.treeSnap = nil
+	a.renamingSessID = ""
 	a.approvalModal.Clear()
 	a.lastError = a.mgr.RecorderWarning()
 	a.refreshSessionsList()
@@ -325,7 +662,7 @@ func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error
 		case agent.EvToolExecutionUpdate:
 			if card, ok := a.toolCards[ev.ToolCallID]; ok {
 				if partial := ExtractResultText(ev.PartialResult); partial != "" {
-					card.ToolOutput = partial
+					card.ToolOutput = StripANSI(partial)
 				}
 			}
 
@@ -333,12 +670,16 @@ func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error
 			if card, ok := a.toolCards[ev.ToolCallID]; ok {
 				card.ToolRunning = false
 				card.ToolError = ev.IsError
+				if ev.IsError {
+					card.CardOpen = true
+				}
 				if ev.DurationMs != nil {
 					card.DurationMs = *ev.DurationMs
 				}
 				if out := ExtractResultText(ev.Result); out != "" {
-					card.ToolOutput = out
+					card.ToolOutput = StripANSI(out)
 				}
+				a.syncToolCardMutationSnapshot(card)
 			}
 			a.activeToolStatus = ""
 		}
@@ -348,10 +689,22 @@ func (a *DeskApp) handleAgentEvent(_ context.Context, ev agent.AgentEvent) error
 
 // submitPrompt either starts a new agent turn or injects a Steer message mid-run.
 func (a *DeskApp) submitPrompt(raw string) {
+	a.submitPromptWithContext(nil, raw)
+}
+
+func (a *DeskApp) submitPromptWithContext(c *ui.Context, raw string) {
 	prompt := strings.TrimSpace(raw)
-	if prompt == "" {
+	if a.handleSlashCommand(c, prompt) {
 		return
 	}
+	if !a.isRunning && strings.HasPrefix(prompt, "!") {
+		a.ExecBangCommand(c, prompt)
+		return
+	}
+	if prompt == "" && len(a.pendingAttachments) == 0 {
+		return
+	}
+	atts, attBadges := a.consumePendingAttachments()
 	a.input = ""
 	a.lastError = ""
 
@@ -366,6 +719,7 @@ func (a *DeskApp) submitPrompt(raw string) {
 			ID:            a.allocID(),
 			Kind:          EntryUser,
 			Text:          prompt,
+			Attachments:   attBadges,
 			Steered:       true,
 			TargetBadge:   badge,
 			IsRemote:      isRem,
@@ -374,7 +728,7 @@ func (a *DeskApp) submitPrompt(raw string) {
 		}
 		a.lastUserEntry = userEntry
 		a.entries = append(a.entries, userEntry)
-		a.mgr.Steer(prompt)
+		a.mgr.SteerWithAttachments(prompt, atts)
 		return
 	}
 
@@ -382,6 +736,7 @@ func (a *DeskApp) submitPrompt(raw string) {
 		ID:            a.allocID(),
 		Kind:          EntryUser,
 		Text:          prompt,
+		Attachments:   attBadges,
 		TargetBadge:   badge,
 		IsRemote:      isRem,
 		ParentEntryID: parentID,
@@ -395,7 +750,7 @@ func (a *DeskApp) submitPrompt(raw string) {
 	a.cancelRun = cancel
 
 	go func() {
-		res, err := a.mgr.Run(ctx, prompt)
+		res, err := a.mgr.RunWithAttachments(ctx, prompt, atts)
 		a.updateUI(func() {
 			a.isRunning = false
 			a.activeToolStatus = ""
@@ -431,6 +786,9 @@ func (a *DeskApp) submitPrompt(raw string) {
 				}
 			}
 			a.refreshSessionsList()
+			if a.win != nil {
+				a.refreshGitStatusAsync()
+			}
 		})
 	}()
 }
@@ -452,8 +810,6 @@ func (a *DeskApp) forkFromChatEntry(c *ui.Context, entry *ChatEntry) {
 		a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
 		a.treeSnap = snap
 		a.input = entry.Text
-		a.sidebarTab = 1
-		a.sidebarCollapsed = false
 		a.lastError = ""
 		c.Toast("已回退至该提问前并回填输入框，修改后发送将创建新分支")
 		return
@@ -468,8 +824,6 @@ func (a *DeskApp) forkFromChatEntry(c *ui.Context, entry *ChatEntry) {
 	a.currentAssistant = nil
 	a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
 	a.treeSnap = snap
-	a.sidebarTab = 1
-	a.sidebarCollapsed = false
 	a.lastError = ""
 	c.Toast("已定位至分支节点 #" + shortEntryID(entry.EntryID) + "，继续发送消息将分叉出新分支")
 }
@@ -498,59 +852,95 @@ func (a *DeskApp) View(c *ui.Context) {
 	}
 
 	// Global Window Keyboard Shortcuts
-	c.OnWindowShortcut(ui.Cmd, ui.Key(','), func() {
+	c.OnWindowShortcut(ui.Cmd, ui.KeyK, func() {
+		a.cmdPalette.Toggle()
+	})
+	c.OnWindowShortcut(ui.Cmd, ui.KeyComma, func() {
 		a.settingsModal.Open = true
 	})
-	c.OnWindowShortcut(ui.Cmd, ui.Key('n'), func() {
+	c.OnWindowShortcut(ui.Cmd, ui.KeyN, func() {
 		a.startNewSession(c)
 	})
-	c.OnWindowShortcut(ui.Cmd, ui.Key('j'), func() {
-		a.termDrawer.Open = !a.termDrawer.Open
-	})
-	c.OnWindowShortcut(ui.Cmd, ui.Key('b'), func() {
+	c.OnWindowShortcut(ui.Cmd, ui.KeyB, func() {
 		a.sidebarCollapsed = !a.sidebarCollapsed
 	})
-	c.OnWindowShortcut(ui.Cmd|ui.Shift, ui.Key('l'), func() {
+	c.OnWindowShortcut(ui.Cmd|ui.Shift, ui.KeyL, func() {
 		a.toggleTheme(c)
 	})
-
-	renderMainAndTerm := func() {
-		if a.termDrawer.Open {
-			if a.termDrawer.Width <= 0 {
-				a.termDrawer.Width = DefaultTermWidth
+	c.OnWindowShortcut(0, ui.KeyEscape, func() {
+		if a.isRunning && !a.settingsModal.Open && !a.cmdPalette.Open && a.approvalModal.PendingCount() == 0 {
+			a.mgr.Abort()
+			if a.cancelRun != nil {
+				a.cancelRun()
 			}
-			// Right-to-left split puts TermDrawer (first) on the right with resizable divider,
-			// while both child panes restore LeftToRight internally.
-			ui.Split(c, &a.termDrawer.Width, func() {
-				a.termDrawer.View(c, p)
-			}, func() {
-				a.renderCenterMain(c, p)
-			}).Direction(ui.RightToLeft).SplitReset(DefaultTermWidth).Fill()
-		} else {
-			a.renderCenterMain(c, p)
 		}
-	}
+	})
 
 	if a.sidebarCollapsed {
-		ui.Row(c).Fill().Background(p.BgCanvas).Children(renderMainAndTerm)
+		ui.Row(c).Fill().Background(p.BgCanvas).Children(func() {
+			a.renderCenterMain(c, p)
+		})
 	} else {
 		ui.Split(c, &a.sidebarWidth, func() {
 			a.renderLeftSidebar(c, p)
-		}, renderMainAndTerm).SplitReset(DefaultSidebarWidth).Fill().Background(p.BgCanvas)
+		}, func() {
+			a.renderCenterMain(c, p)
+		}).SplitReset(DefaultSidebarWidth).Fill().Background(p.BgCanvas)
 	}
 
-	// Settings Modal (API Endpoints, Workspaces & Safety Policy)
-	a.settingsModal.Render(c, p, a.cfg, a.mgr, a.updateUI, func() error {
+	// Settings Modal (API Endpoints, Workspaces, Safety Policy & MCP Servers)
+	a.settingsModal.Render(c, p, a.win, a.cfg, a.mgr, a.updateUI, func() error {
 		if err := a.mgr.ApplyProfile(a.cfg.ActiveProfile()); err != nil {
 			a.lastError = "应用渠道配置失败: " + err.Error()
 			return err
 		}
 		a.mgr.SetSafetyPolicy(a.cfg.SafetyPolicy)
-		if target := a.cfg.ActiveTarget(); target != nil {
-			a.mgr.SwitchTarget(*target)
+		mcpCopy := make([]store.MCPServerConfig, len(a.cfg.MCPServers))
+		for i, ms := range a.cfg.MCPServers {
+			mcpCopy[i] = ms.Clone()
 		}
+		if a.win != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				_ = a.mgr.SyncMCPServers(ctx, mcpCopy)
+				a.updateUI(func() {})
+			}()
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = a.mgr.SyncMCPServers(ctx, mcpCopy)
+			cancel()
+		}
+		if target := a.cfg.ActiveTarget(); target != nil {
+			cur := a.mgr.Router().Target()
+			if !cur.SameLocation(*target) {
+				if !a.isRunning {
+					a.SwitchWorkspace(nil, *target)
+				} else {
+					a.mgr.SwitchTarget(*target)
+				}
+			} else if cur.Trusted != target.Trusted || cur.Name != target.Name {
+				a.mgr.Router().UpdateTargetMetadata(*target)
+				if cur.Trusted != target.Trusted {
+					if target.IsRemote && a.win != nil {
+						go func(trusted bool) {
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+							a.mgr.SetWorkspaceTrust(ctx, trusted)
+							a.updateUI(func() {})
+						}(target.Trusted)
+					} else {
+						a.mgr.SetWorkspaceTrust(context.Background(), target.Trusted)
+					}
+				}
+			}
+		}
+		a.refreshSessionsList()
 		return nil
 	})
+
+	// Spotlight Command Palette (Cmd/Ctrl+K)
+	a.cmdPalette.Render(c, p, a.buildPaletteCommands())
 
 	// Human-in-the-Loop High-Risk Tool Approval Modal
 	if a.mgr != nil {
@@ -558,13 +948,57 @@ func (a *DeskApp) View(c *ui.Context) {
 	}
 }
 
+const defaultVisibleSessionsPerWorkspace = 6
+
+func (a *DeskApp) sessionsForWorkspace(wt store.WorkspaceTarget, activeTargetID string) []harness.SavedSessionSummary {
+	if a.workspaceSessions != nil {
+		if list, ok := a.workspaceSessions[wt.ID]; ok && len(list) > 0 {
+			return list
+		}
+	}
+	if wt.ID == activeTargetID && len(a.savedSessions) > 0 {
+		return a.savedSessions
+	}
+	return nil
+}
+
+func (a *DeskApp) visibleWorkspaceSessions(wtID string, sessions []harness.SavedSessionSummary, isActiveWorkspace bool) ([]harness.SavedSessionSummary, bool) {
+	if len(sessions) <= defaultVisibleSessionsPerWorkspace {
+		return sessions, false
+	}
+	if a.expandedAllSessions != nil && a.expandedAllSessions[wtID] {
+		return sessions, true
+	}
+	out := make([]harness.SavedSessionSummary, defaultVisibleSessionsPerWorkspace)
+	copy(out, sessions[:defaultVisibleSessionsPerWorkspace])
+	if isActiveWorkspace && a.activeSessID != "" {
+		inTop := false
+		for _, s := range out {
+			if s.ID == a.activeSessID {
+				inTop = true
+				break
+			}
+		}
+		if !inTop {
+			for i := defaultVisibleSessionsPerWorkspace; i < len(sessions); i++ {
+				if sessions[i].ID == a.activeSessID {
+					out[defaultVisibleSessionsPerWorkspace-1] = sessions[i]
+					break
+				}
+			}
+		}
+	}
+	return out, true
+}
+
 func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 	activeTarget := a.mgr.Router().Target()
 	bar := c.TitleBar()
 	leftHeaderPad := max(bar.Left, 12)
+	switchBlocked := a.isRunning || a.approvalModal.PendingCount() > 0
 
 	ui.Column(c).Fill().Clip().Background(p.BgSidebar).Children(func() {
-		// Row 0: Unified 44px Top Header Bar (aligns pixel-for-pixel with CenterMain & TermDrawer)
+		// Row 0: Unified 44px Top Header Bar (aligns pixel-for-pixel with CenterMain)
 		ui.Row(c).FillWidth().Height(TopBarHeight).Padding(0, 8, 0, leftHeaderPad).Gap(4).
 			AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).
 			DragWindow().Children(func() {
@@ -597,172 +1031,108 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 			}
 		})
 
-		// Section 1: Workspace Target Hot-Switcher — Quiet & Neutral by Default
-		ui.Column(c).FillWidth().Padding(10, 8, 10, 8).Gap(5).
-			BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
-			ui.Row(c).FillWidth().Padding(0, 4).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "工作区").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.TextMuted)
-				ui.Spacer(c)
-				IconTipBtn(c, p, IconPlus, 22, 13, "添加本地目录或远程 SSH 目标", func() {
-					a.settingsModal.ActiveTab = 1
-					a.settingsModal.Open = true
-				})
+		// Section 1: Quiet "工作区" Header + Filter & Add-Workspace Actions
+		searchActive := a.sidebarSearchOpen || strings.TrimSpace(a.sessionSearch) != ""
+		ui.Row(c).FillWidth().Padding(10, 10, 4, 16).Gap(2).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "工作区").FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextMuted).SingleLine()
+			ui.Spacer(c)
+
+			ToolbarIconBtn(c, p, IconFilter, 26, 13.5, searchActive, ui.Transparent, "筛选工作区与会话", func() {
+				if searchActive {
+					a.sidebarSearchOpen = false
+					a.sessionSearch = ""
+				} else {
+					a.sidebarSearchOpen = true
+				}
 			})
 
-			hasPendingApproval := a.approvalModal.PendingCount() > 0
-			// Sized to cleanly fit 4 rows (4*36 + 3*2 = 150px) without awkward mid-row clipping
-			ui.Scroll(c).MaxHeight(152).FillWidth().Children(func() {
-				ui.Column(c).FillWidth().Gap(2).Children(func() {
-					for i := range a.cfg.Targets {
-						wt := a.cfg.Targets[i]
-						isSelected := wt.ID == activeTarget.ID
-
-						icon := IconFolder
-						iconBg := p.BgElevated
-						iconFg := p.TextSecondary
-						if isSelected && !wt.IsRemote {
-							iconFg = p.TextPrimary
-						}
-						if wt.IsRemote {
-							icon = IconServer
-							iconBg = p.SSHSoft
-							iconFg = p.SSHColor
-						}
-
-						b := ui.ButtonBase(c).FillWidth().MinWidth(0).Height(36).Padding(0, 8).Radius(RadiusMD).
-							Gap(8).AlignItems(ui.Center).Disabled(hasPendingApproval)
-						targetBg := ui.Transparent
-						nameCol := p.TextSecondary
-						if isSelected {
-							targetBg = p.BgActive
-							nameCol = p.TextPrimary
-						} else if b.Hovered() && !hasPendingApproval {
-							targetBg = p.BgHover
-							nameCol = p.TextPrimary
-						}
-
-						tip := "切换执行环境至 " + wt.ShortName() + " (" + wt.DisplaySub() + ")"
-						if hasPendingApproval {
-							tip = "请先处理当前挂起的安全审批弹窗，再切换执行环境"
-						}
-
-						b.Background(targetBg).
-							Tooltip(tip).
-							Children(func() {
-								ui.Row(c).Size(22, 22).Shrink(0).Radius(RadiusSM).Background(iconBg).
-									AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-									ui.Icon(c, icon).Size(12.5, 12.5).TextColor(iconFg)
-								})
-								ui.Column(c).Grow(1).MinWidth(0).Gap(0).Children(func() {
-									el := ui.Text(c, wt.ShortName()).FontSize(FontSmall).TextColor(nameCol).SingleLine().Ellipsis("...")
-									if isSelected {
-										el.FontWeight(WeightMedium)
-									}
-									ui.Text(c, wt.DisplaySub()).Font(FontMono).FontSize(10).TextColor(p.TextMuted).SingleLine().Ellipsis("...")
-								})
-								if wt.IsRemote {
-									ui.Row(c).Padding(1, 5).Shrink(0).Radius(RadiusSM).Background(p.SSHSoft).Gap(3).AlignItems(ui.Center).Children(func() {
-										if isSelected {
-											ui.Box(c).Size(4.5, 4.5).Radius(RadiusPill).Background(p.SSHColor)
-										}
-										ui.Text(c, "SSH").Font(FontMono).FontWeight(WeightMedium).FontSize(9.5).TextColor(p.SSHColor)
-									})
-								} else if isSelected {
-									ui.Box(c).Size(5.5, 5.5).Shrink(0).Radius(RadiusPill).Background(p.LocalColor)
-								}
-							})
-						if b.Clicked() {
-							a.cfg.ActiveTargetID = wt.ID
-							a.mgr.SwitchTarget(wt)
-							if a.saveConfigOrWarn(c) {
-								c.Toast("已切换执行环境至: " + wt.ShortName())
-							}
-						}
-					}
-				})
+			addBtn := ui.ButtonBase(c).Size(26, 26).Radius(RadiusSM).
+				AlignItems(ui.Center).Justify(ui.Center).
+				Tooltip("添加本地项目目录或手动配置远程 SSH 工作区").Label("添加工作区")
+			addBg := ui.Transparent
+			addFg := p.TextMuted
+			if addBtn.Hovered() || addBtn.Pressed() {
+				addBg = p.BgHover
+				addFg = p.TextPrimary
+			}
+			addBtn.Background(addBg).Children(func() {
+				ui.Icon(c, IconFolderPlus).Size(14, 14).TextColor(addFg)
+			}).PopoverMenuButton(func(m *ui.Menu) {
+				if m.Item("打开本地项目目录...").Chosen() {
+					a.triggerQuickAddLocalWorkspace()
+				}
+				if m.Item("手动添加远程 SSH 工作区...").Chosen() {
+					a.settingsModal.NewTargetRemote = true
+					a.settingsModal.ActiveTab = 1
+					a.settingsModal.Open = true
+				}
+				m.Separator()
+				if m.Item("刷新会话列表").Chosen() {
+					a.refreshSessionsList()
+					c.Toast("已刷新所有工作区会话列表")
+				}
+				if m.Item("管理所有工作区...").Chosen() {
+					a.settingsModal.ActiveTab = 1
+					a.settingsModal.Open = true
+				}
 			})
 		})
 
-		// Section 2: Unified Session History & Visual Branch Tree
-		ui.Column(c).Grow(1).FillWidth().MinWidth(0).Padding(10, 8, 6, 8).Gap(8).Children(func() {
-			branchCount := 1
-			if a.treeSnap != nil && a.treeSnap.BranchCount > 0 {
-				branchCount = a.treeSnap.BranchCount
-			}
-
-			// Labeled Segmented Switcher + Refresh Action
-			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Padding(0, 2).Children(func() {
-				ui.Row(c).Grow(1).Padding(2).Radius(RadiusMD).
-					Background(p.InputBg).Border(1, p.BorderSubtle).Gap(2).Children(func() {
-					// Tab 0: Session History
-					histActive := a.sidebarTab == 0
-					hb := ui.ButtonBase(c).Grow(1).Height(24).Padding(0, 6).Radius(RadiusSM).Gap(5).
-						AlignItems(ui.Center).Justify(ui.Center).Tooltip("历史对话列表")
-					hBg := ui.Transparent
-					hFg := p.TextMuted
-					if histActive {
-						hBg = p.BgElevated
-						if p.IsLight {
-							hBg = p.BgSurface
+		if searchActive {
+			ui.Row(c).FillWidth().Padding(2, 10, 6, 10).Gap(4).AlignItems(ui.Center).Children(func() {
+				ui.TextInput(c, &a.sessionSearch).Grow(1).Placeholder("搜索工作区或会话标题...").AutoFocus().
+					OnTextKey(func(k ui.TextKey) bool {
+						if k.Key == ui.KeyEscape {
+							a.sessionSearch = ""
+							a.sidebarSearchOpen = false
+							return true
 						}
-						hFg = p.TextPrimary
-					} else if hb.Hovered() {
-						hFg = p.TextSecondary
-					}
-					hb.Background(hBg).Children(func() {
-						ui.Icon(c, IconChat).Size(12, 12).TextColor(hFg)
-						el := ui.Text(c, "对话").FontSize(FontCaption).TextColor(hFg).SingleLine()
-						if histActive {
-							el.FontWeight(WeightMedium)
-						}
+						return false
 					})
-					if hb.Clicked() {
-						a.sidebarTab = 0
-					}
-
-					// Tab 1: Session Branch Tree
-					treeActive := a.sidebarTab == 1
-					treeLabel := "分支"
-					if branchCount > 1 {
-						treeLabel = fmt.Sprintf("分支 %d", branchCount)
-					}
-					tb := ui.ButtonBase(c).Grow(1).Height(24).Padding(0, 6).Radius(RadiusSM).Gap(5).
-						AlignItems(ui.Center).Justify(ui.Center).
-						Tooltip(fmt.Sprintf("会话分支树 (%d 分支)", branchCount))
-					tBg := ui.Transparent
-					tFg := p.TextMuted
-					if treeActive {
-						tBg = p.BgElevated
-						if p.IsLight {
-							tBg = p.BgSurface
-						}
-						tFg = p.TextPrimary
-					} else if tb.Hovered() {
-						tFg = p.TextSecondary
-					}
-					tb.Background(tBg).Children(func() {
-						ui.Icon(c, IconBranch).Size(12, 12).TextColor(tFg)
-						el := ui.Text(c, treeLabel).FontFeatures("tnum").FontSize(FontCaption).TextColor(tFg).SingleLine()
-						if treeActive {
-							el.FontWeight(WeightMedium)
-						}
+				if strings.TrimSpace(a.sessionSearch) != "" {
+					IconTipBtn(c, p, IconCross, 24, 12.5, "清空筛选", func() {
+						a.sessionSearch = ""
 					})
-					if tb.Clicked() {
-						a.sidebarTab = 1
-					}
-				})
-
-				IconTipBtn(c, p, IconRefresh, 26, 13, "刷新会话列表与分支树", func() {
-					a.refreshSessionsList()
-					c.Toast("已刷新会话列表与分支树")
-				})
+				}
 			})
+		}
 
-			if a.sidebarTab == 0 {
-				a.renderSessionListPanel(c, p)
-			} else {
-				a.renderSessionTreePanel(c, p)
-			}
+		// Section 2: Unified Single-Scroll Workspace -> Sessions Tree
+		q := strings.ToLower(strings.TrimSpace(a.sessionSearch))
+		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+			ui.Column(c).FillWidth().MinWidth(0).Padding(4, 8, 14, 8).Gap(10).Children(func() {
+				matchedWorkspaces := 0
+				for i := range a.cfg.Targets {
+					wt := a.cfg.Targets[i]
+					allSessions := a.sessionsForWorkspace(wt, activeTarget.ID)
+					sessions := allSessions
+
+					if q != "" {
+						wsMatches := strings.Contains(strings.ToLower(wt.ShortName()), q) ||
+							strings.Contains(strings.ToLower(wt.DisplaySub()), q)
+						var filtered []harness.SavedSessionSummary
+						for _, s := range allSessions {
+							if strings.Contains(strings.ToLower(s.Title), q) || strings.Contains(strings.ToLower(s.Timestamp), q) {
+								filtered = append(filtered, s)
+							}
+						}
+						if !wsMatches && len(filtered) == 0 {
+							continue
+						}
+						if len(filtered) > 0 {
+							sessions = filtered
+						}
+					}
+
+					matchedWorkspaces++
+					a.renderSidebarWorkspaceNode(c, p, wt, activeTarget.ID, sessions, q != "", switchBlocked)
+				}
+
+				if matchedWorkspaces == 0 && q != "" {
+					ui.Text(c, "未找到匹配的工作区或会话").
+						FontSize(FontCaption).TextColor(p.TextMuted).Padding(12, 16)
+				}
+			})
 		})
 
 		// Section 3: Quiet Bottom Utility Bar (40px)
@@ -788,87 +1158,305 @@ func (a *DeskApp) renderLeftSidebar(c *ui.Context, p Palette) {
 	})
 }
 
-func (a *DeskApp) renderSessionListPanel(c *ui.Context, p Palette) {
-	ui.Scroll(c).Grow(1).FillWidth().Children(func() {
-		ui.Column(c).FillWidth().Gap(2).Children(func() {
-			if len(a.savedSessions) == 0 {
-				ui.Column(c).FillWidth().Padding(16, 10).AlignItems(ui.Center).Gap(4).Children(func() {
-					ui.Text(c, "暂无历史对话").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
-					ui.Text(c, "发送第一条指令后自动持久化为树状会话").
-						FontSize(FontCaption).LineHeight(1.5).TextColor(p.TextMuted).TextAlign(ui.Center)
-				})
-				return
+func (a *DeskApp) renderSidebarWorkspaceNode(
+	c *ui.Context,
+	p Palette,
+	wt store.WorkspaceTarget,
+	activeTargetID string,
+	sessions []harness.SavedSessionSummary,
+	forceExpand bool,
+	switchBlocked bool,
+) {
+	isSelected := wt.ID == activeTargetID
+	if a.collapsedWorkspaces == nil {
+		a.collapsedWorkspaces = map[string]bool{}
+	}
+	if a.expandedAllSessions == nil {
+		a.expandedAllSessions = map[string]bool{}
+	}
+	collapsed := a.collapsedWorkspaces[wt.ID] && !forceExpand
+
+	ui.Column(c).FillWidth().MinWidth(0).Gap(1).Children(func() {
+		// Parent Workspace Row — 8px left pad + 15px icon + 9px gap => title text starts cleanly at x=32px
+		wsRow := ui.Row(c).FillWidth().MinWidth(0).Height(30).Radius(RadiusSM).AlignItems(ui.Center)
+		wsHovered := wsRow.Hovered()
+		wsBg := ui.Transparent
+		if wsHovered && !switchBlocked {
+			wsBg = p.BgHover
+		}
+
+		wsIcon := IconFolder
+		wsIconCol := p.TextMuted
+		wsNameCol := p.TextSecondary
+		if wt.IsRemote {
+			wsIcon = IconCloud
+			if isSelected {
+				wsIconCol = p.SSHColor
+			} else if wsHovered {
+				wsIconCol = p.SSHColor.Alpha(0.85)
 			}
+		} else if isSelected {
+			wsIconCol = p.TextPrimary
+		} else if wsHovered {
+			wsIconCol = p.TextSecondary
+		}
+		if isSelected || wsHovered {
+			wsNameCol = p.TextPrimary
+		}
 
-			for _, info := range a.savedSessions {
-				sessInfo := info
-				isActive := a.activeSessID == sessInfo.ID
+		tip := wt.ShortName() + " · " + wt.DisplaySub()
+		if a.approvalModal.PendingCount() > 0 {
+			tip = "请先处理当前挂起的安全审批弹窗，再切换工作区"
+		} else if a.isRunning {
+			tip = "请等待当前对话轮次完成或点击停止后，再切换工作区"
+		}
 
-				b := ui.ButtonBase(c).FillWidth().MinWidth(0).Padding(7, 10).Radius(RadiusMD).Disabled(a.isRunning)
-				targetBg := ui.Transparent
-				titleCol := p.TextSecondary
-				if isActive {
-					targetBg = p.BgActive
-					titleCol = p.TextPrimary
-				} else if b.Hovered() && !a.isRunning {
-					targetBg = p.BgHover
-					titleCol = p.TextPrimary
+		wsRow.Background(wsBg).Padding(0, 4, 0, 0).ContextMenu(func(m *ui.Menu) {
+			if m.Item("在此工作区新建对话").Disabled(switchBlocked).Chosen() {
+				a.collapsedWorkspaces[wt.ID] = false
+				if isSelected {
+					a.startNewSession(c)
+				} else {
+					a.SwitchWorkspace(c, wt)
 				}
-
-				metaLine := fmt.Sprintf("%s · %d 条消息", sessInfo.Timestamp, sessInfo.Messages)
-				if sessInfo.Timestamp == "" {
-					metaLine = fmt.Sprintf("#%s · %d 条消息", shortEntryID(sessInfo.ID), sessInfo.Messages)
+			}
+			if len(sessions) > 0 {
+				toggleLabel := "折叠会话列表"
+				if a.collapsedWorkspaces[wt.ID] {
+					toggleLabel = "展开会话列表"
 				}
-
-				b.Background(targetBg).Children(func() {
-					ui.Column(c).FillWidth().MinWidth(0).Gap(2).Children(func() {
-						el := ui.Text(c, sessInfo.Title).FontSize(FontSmall).TextColor(titleCol).SingleLine().Ellipsis("...")
-						if isActive {
-							el.FontWeight(WeightMedium)
+				if m.Item(toggleLabel).Chosen() {
+					a.collapsedWorkspaces[wt.ID] = !a.collapsedWorkspaces[wt.ID]
+				}
+			}
+			trustLabel := "信任项目级 Skills 与指令"
+			if wt.Trusted {
+				trustLabel = "取消信任项目级 Skills"
+			}
+			if m.Item(trustLabel).Chosen() {
+				nextTrust := !wt.Trusted
+				a.cfg.SetTargetTrusted(wt.ID, nextTrust)
+				_ = a.saveConfigOrWarn(c)
+				if isSelected {
+					a.mgr.SetWorkspaceTrust(context.Background(), nextTrust)
+				}
+			}
+			m.Separator()
+			if m.Item("管理工作区设置...").Chosen() {
+				a.settingsModal.ActiveTab = 1
+				a.settingsModal.Open = true
+			}
+			if len(a.cfg.Targets) > 1 {
+				if m.Item("移除此工作区").Danger().Disabled(switchBlocked).Chosen() {
+					if a.cfg.RemoveTarget(wt.ID) {
+						_ = a.saveConfigOrWarn(c)
+						a.refreshSessionsList()
+						if isSelected {
+							if next := a.cfg.ActiveTarget(); next != nil {
+								a.SwitchWorkspace(c, *next)
+							}
 						}
-						ui.Text(c, metaLine).FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).SingleLine()
-					})
-				})
-				if b.Clicked() {
-					projected, snap, err := a.mgr.ResumeSavedSessionProjected(sessInfo.Path, a.cfg.ActiveProfile())
-					if err != nil {
-						a.lastError = err.Error()
-					} else {
-						a.toolCards = map[string]*ChatEntry{}
-						a.currentAssistant = nil
-						a.lastUserEntry = nil
-						a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
-						a.activeSessID = sessInfo.ID
-						a.treeSnap = snap
-						a.lastError = ""
-						c.Toast("已加载历史会话: " + sessInfo.Title)
 					}
 				}
 			}
-		})
-	})
-}
-
-func (a *DeskApp) renderSessionTreePanel(c *ui.Context, p Palette) {
-	// Shares the exact same borderless sidebar container style as renderSessionListPanel!
-	ui.Column(c).Grow(1).FillWidth().MinWidth(0).Gap(6).Children(func() {
-		if a.treeSnap == nil || len(a.treeSnap.Nodes) == 0 {
-			ui.Column(c).FillWidth().Padding(16, 10).AlignItems(ui.Center).Gap(4).Children(func() {
-				ui.Text(c, "尚无会话分支节点").FontSize(FontSmall).FontWeight(WeightMedium).TextColor(p.TextSecondary)
-				ui.Text(c, "对话产生后将在此实时展示拓扑树，点击任意节点即可回溯或分叉重试。").
-					FontSize(FontCaption).LineHeight(1.5).TextColor(p.TextMuted).TextAlign(ui.Center)
+		}).Children(func() {
+			b := ui.ButtonBase(c).Grow(1).MinWidth(0).Height(30).Padding(0, 6, 0, 8).Radius(RadiusSM).
+				Gap(9).AlignItems(ui.Center).Disabled(switchBlocked).Tooltip(tip)
+			b.Children(func() {
+				ui.Icon(c, wsIcon).Size(15, 15).TextColor(wsIconCol).Shrink(0)
+				el := ui.Text(c, wt.ShortName()).Grow(1).MinWidth(0).
+					FontSize(FontBody).TextColor(wsNameCol).SingleLine().Ellipsis("...")
+				if isSelected {
+					el.FontWeight(WeightMedium)
+				}
+				if collapsed && len(sessions) > 0 && !wsHovered {
+					ui.Text(c, fmt.Sprintf("%d", len(sessions))).
+						FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
+					ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(p.TextMuted).Shrink(0)
+				}
 			})
+			if b.Clicked() {
+				if !isSelected {
+					a.collapsedWorkspaces[wt.ID] = false
+					a.SwitchWorkspace(c, wt)
+				} else if len(sessions) > 0 {
+					a.collapsedWorkspaces[wt.ID] = !a.collapsedWorkspaces[wt.ID]
+				}
+			}
+
+			if wsHovered && !switchBlocked {
+				ui.Row(c).Shrink(0).Gap(1).AlignItems(ui.Center).Children(func() {
+					IconTipBtn(c, p, IconPlus, 22, 12.5, "在 "+wt.ShortName()+" 新建对话", func() {
+						a.collapsedWorkspaces[wt.ID] = false
+						if isSelected {
+							a.startNewSession(c)
+						} else {
+							a.SwitchWorkspace(c, wt)
+						}
+					})
+					if len(sessions) > 0 {
+						chev := IconChevronDown
+						chevTip := "折叠工作区会话"
+						if collapsed {
+							chev = IconChevronRight
+							chevTip = "展开工作区会话"
+						}
+						IconTipBtn(c, p, chev, 22, 12, chevTip, func() {
+							a.collapsedWorkspaces[wt.ID] = !a.collapsedWorkspaces[wt.ID]
+						})
+					}
+				})
+			}
+		})
+
+		if collapsed {
 			return
 		}
 
-		ui.Row(c).FillWidth().Padding(0, 6).AlignItems(ui.Center).Gap(5).Children(func() {
-			ui.Text(c, fmt.Sprintf("%d 条分支 · 共 %d 个节点", a.treeSnap.BranchCount, len(a.treeSnap.Nodes))).
-				FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted)
-		})
+		if len(sessions) == 0 {
+			if isSelected {
+				ui.Row(c).FillWidth().Height(26).Padding(0, 8, 0, 32).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "暂无历史对话").FontSize(FontCaption).TextColor(p.TextMuted).SingleLine()
+				})
+			}
+			return
+		}
 
-		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
-			a.renderTreeNodesList(c, p, a.treeSnap.Nodes)
+		shownSessions := sessions
+		hasOverflow := false
+		if !forceExpand {
+			shownSessions, hasOverflow = a.visibleWorkspaceSessions(wt.ID, sessions, isSelected)
+		}
+
+		for _, info := range shownSessions {
+			sessInfo := info
+			a.renderSidebarSessionItem(c, p, wt, sessInfo, isSelected, switchBlocked)
+		}
+
+		if hasOverflow {
+			expandedAll := a.expandedAllSessions[wt.ID]
+			moreLabel := fmt.Sprintf("查看全部 (%d)", len(sessions))
+			if expandedAll {
+				moreLabel = "收起"
+			}
+			mb := ui.ButtonBase(c).FillWidth().MinWidth(0).Height(26).Padding(0, 8, 0, 32).Radius(RadiusSM).
+				AlignItems(ui.Center).Label(moreLabel)
+			mCol := p.TextMuted
+			mBg := ui.Transparent
+			if mb.Hovered() {
+				mCol = p.TextSecondary
+				mBg = p.BgHover
+			}
+			mb.Background(mBg).Children(func() {
+				ui.Text(c, moreLabel).FontFeatures("tnum").FontSize(FontSmall).TextColor(mCol).SingleLine()
+			})
+			if mb.Clicked() {
+				a.expandedAllSessions[wt.ID] = !expandedAll
+			}
+		}
+	})
+}
+
+func (a *DeskApp) renderSidebarSessionItem(
+	c *ui.Context,
+	p Palette,
+	wt store.WorkspaceTarget,
+	sessInfo harness.SavedSessionSummary,
+	isSelectedWorkspace bool,
+	switchBlocked bool,
+) {
+	isActive := isSelectedWorkspace && a.activeSessID == sessInfo.ID
+
+	if a.renamingSessID == sessInfo.ID {
+		ui.Row(c).FillWidth().MinWidth(0).Padding(2, 4, 2, 28).Radius(RadiusSM).
+			Background(p.BgSurface).Border(1, p.BorderFocus).Gap(3).AlignItems(ui.Center).Children(func() {
+			ui.TextInput(c, &a.renameDraft).Grow(1).Placeholder("输入自定义标题").AutoFocus().
+				OnTextKey(func(k ui.TextKey) bool {
+					if k.Key == ui.KeyEnter && k.Mods == 0 {
+						a.RenameSession(c, sessInfo.ID, k.Text())
+						return true
+					}
+					if k.Key == ui.KeyEscape {
+						a.renamingSessID = ""
+						a.renameDraft = ""
+						return true
+					}
+					return false
+				})
+			IconTipBtn(c, p, IconCheck, 22, 12.5, "确认保存标题", func() {
+				a.RenameSession(c, sessInfo.ID, a.renameDraft)
+			})
+			IconTipBtn(c, p, IconCross, 22, 12.5, "取消重命名", func() {
+				a.renamingSessID = ""
+				a.renameDraft = ""
+			})
 		})
+		return
+	}
+
+	rowWrap := ui.Row(c).FillWidth().MinWidth(0).Height(29).Radius(RadiusSM).AlignItems(ui.Center)
+	rowHovered := rowWrap.Hovered() || rowWrap.FocusWithin()
+	targetBg := ui.Transparent
+	titleCol := p.TextSecondary
+	if isActive {
+		targetBg = p.BgActive
+		titleCol = p.TextPrimary
+	} else if rowHovered && !switchBlocked {
+		targetBg = p.BgHover
+		titleCol = p.TextPrimary
+	}
+
+	ageText := sessInfo.RelativeTime
+	if ageText == "" {
+		ageText = sessInfo.Timestamp
+	}
+
+	metaTip := sessInfo.Title
+	if sessInfo.Timestamp != "" {
+		metaTip = fmt.Sprintf("%s\n%s · %d 条消息", sessInfo.Title, sessInfo.Timestamp, sessInfo.Messages)
+	}
+
+	rowWrap.Background(targetBg).Padding(0, 4, 0, 0).ContextMenu(func(m *ui.Menu) {
+		if m.Item("打开会话").Disabled(switchBlocked).Chosen() {
+			a.OpenWorkspaceSession(c, wt, sessInfo)
+		}
+		if m.Item("重命名会话...").Disabled(a.isRunning).Chosen() {
+			a.renamingSessID = sessInfo.ID
+			a.renameDraft = sessInfo.Title
+		}
+		m.Separator()
+		if m.Item("删除会话").Danger().Disabled(a.isRunning).Chosen() {
+			a.DeleteSession(c, sessInfo)
+		}
+	}).Children(func() {
+		// Left padding 32px aligns session text cleanly beneath the parent workspace title (past the 15px icon)
+		b := ui.ButtonBase(c).Grow(1).MinWidth(0).Height(29).Padding(0, 6, 0, 32).Radius(RadiusSM).
+			Gap(8).AlignItems(ui.Center).Disabled(switchBlocked).Tooltip(metaTip)
+		b.Children(func() {
+			el := ui.Text(c, sessInfo.Title).Grow(1).MinWidth(0).
+				FontSize(FontSmall + 0.5).TextColor(titleCol).SingleLine().Ellipsis("...")
+			if isActive {
+				el.FontWeight(WeightMedium)
+			}
+			if (!rowHovered || switchBlocked) && ageText != "" {
+				ui.Text(c, ageText).FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0).SingleLine()
+			}
+		})
+		if b.Clicked() {
+			a.OpenWorkspaceSession(c, wt, sessInfo)
+		}
+
+		if rowHovered && !switchBlocked {
+			ui.Row(c).Shrink(0).Gap(1).AlignItems(ui.Center).Children(func() {
+				IconTipBtn(c, p, IconFileEdit, 21, 11.5, "重命名会话", func() {
+					a.renamingSessID = sessInfo.ID
+					a.renameDraft = sessInfo.Title
+				})
+				DangerIconBtn(c, p, IconTrash, 21, 11.5, "删除会话", func() {
+					a.DeleteSession(c, sessInfo)
+				})
+			})
+		}
 	})
 }
 
@@ -1005,6 +1593,7 @@ func (a *DeskApp) renderTreeNodesList(c *ui.Context, p Palette, nodes []harness.
 					a.lastUserEntry = nil
 					a.entries = RebuildEntriesFromProjected(projected, &a.nextEntryID)
 					a.treeSnap = snap
+					a.branchPopoverOpen = false
 					a.lastError = ""
 					c.Toast("已切换至会话树节点 #" + shortEntryID(n.EntryID))
 				}
@@ -1152,6 +1741,129 @@ func (a *DeskApp) renderCascadingModelMenu(c *ui.Context, m *ui.Menu) {
 	}
 }
 
+func (a *DeskApp) renderSSHStatusPill(c *ui.Context, p Palette) {
+	st := a.mgr.SSHStatus()
+	pill := ui.ButtonBase(c).Height(26).Padding(0, 9).Radius(RadiusSM).Gap(5).AlignItems(ui.Center).Shrink(0)
+
+	switch {
+	case st.Checking:
+		pill.Background(p.InputBg).Border(1, p.BorderSubtle).Tooltip("正在检测 SSH 连通性与远端环境...").Children(func() {
+			ui.Spinner(c).Size(11, 11)
+			ui.Text(c, "连接检测中").FontSize(FontCaption).TextColor(p.TextMuted).SingleLine()
+		})
+	case st.Connected:
+		bg := p.LocalSoft
+		if pill.Hovered() {
+			bg = p.LocalColor.Alpha(0.2)
+		}
+		tip := fmt.Sprintf("SSH 已连接 (%s · %s)，点击刷新状态", st.RemoteOS, st.ResolvedWorkDir)
+		pill.Background(bg).Border(1, p.LocalColor.Alpha(0.3)).Tooltip(tip).Children(func() {
+			ui.Box(c).Size(5.5, 5.5).Radius(RadiusPill).Background(p.LocalColor)
+			ui.Text(c, fmt.Sprintf("%dms", st.LatencyMs)).Font(FontMono).FontFeatures("tnum").
+				FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.LocalColor).SingleLine()
+		})
+		if pill.Clicked() {
+			a.probeActiveSSHAsync(false)
+		}
+	case st.Error != "":
+		bg := p.DangerSoft
+		if pill.Hovered() {
+			bg = p.DangerColor.Alpha(0.22)
+		}
+		pill.Background(bg).Border(1, p.DangerColor.Alpha(0.35)).
+			Tooltip("SSH 连接异常: " + st.Error + "（点击重置复用连接并重连）").Children(func() {
+			ui.Icon(c, IconRefresh).Size(11.5, 11.5).TextColor(p.DangerColor)
+			ui.Text(c, "未连接 · 重连").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.DangerColor).SingleLine()
+		})
+		if pill.Clicked() {
+			a.probeActiveSSHAsync(true)
+		}
+	default:
+		bg := p.InputBg
+		if pill.Hovered() {
+			bg = p.BgHover
+		}
+		pill.Background(bg).Border(1, p.BorderSubtle).Tooltip("点击检测 SSH 服务器连接延迟与状态").Children(func() {
+			ui.Icon(c, IconRefresh).Size(11.5, 11.5).TextColor(p.TextMuted)
+			ui.Text(c, "检测连接").FontSize(FontCaption).TextColor(p.TextSecondary).SingleLine()
+		})
+		if pill.Clicked() {
+			a.probeActiveSSHAsync(false)
+		}
+	}
+}
+
+func (a *DeskApp) renderBranchTreePill(c *ui.Context, p Palette) {
+	branchCount := 0
+	if a.treeSnap != nil {
+		branchCount = a.treeSnap.BranchCount
+	}
+	if branchCount <= 1 && !a.branchPopoverOpen {
+		return
+	}
+	if branchCount < 1 {
+		branchCount = 1
+	}
+
+	b := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(RadiusSM).
+		Border(1, p.BorderSubtle).Gap(4).AlignItems(ui.Center).Shrink(0).
+		Tooltip(fmt.Sprintf("当前会话共 %d 个对话分支，点击切换或回溯分支节点", branchCount))
+	bBg := ui.Transparent
+	if b.Hovered() || b.Pressed() || a.branchPopoverOpen {
+		bBg = p.BgHover
+	}
+	b.Background(bBg).Children(func() {
+		ui.Icon(c, IconBranch).Size(12, 12).TextColor(p.Accent)
+		ui.Text(c, fmt.Sprintf("分支 · %d", branchCount)).
+			FontFeatures("tnum").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.TextSecondary).SingleLine()
+	})
+	if b.Clicked() {
+		if !a.branchPopoverOpen && a.mgr != nil {
+			a.treeSnap = a.mgr.SessionTreeSnapshot()
+		}
+		a.branchPopoverOpen = !a.branchPopoverOpen
+	}
+
+	ui.PopoverBase(c, b, &a.branchPopoverOpen, func(panel ui.Element) {
+		panel.Width(350).Margin(4, 0, 0, 0).Padding(0).Radius(RadiusMD).
+			Background(p.ModalBg).Border(1, p.BorderStrong).
+			Shadow(0, 12, 32, -6, p.ShadowModal).Children(func() {
+			ui.Column(c).FillWidth().Children(func() {
+				ui.Row(c).FillWidth().Padding(10, 12).AlignItems(ui.Center).Gap(6).
+					BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).Children(func() {
+					ui.Icon(c, IconBranch).Size(13, 13).TextColor(p.Accent)
+					ui.Text(c, "对话分支拓扑树").FontWeight(WeightSemibold).FontSize(FontSmall).TextColor(p.TextPrimary)
+					if a.treeSnap != nil && len(a.treeSnap.Nodes) > 0 {
+						ui.Text(c, fmt.Sprintf("%d 分支 · %d 节点", a.treeSnap.BranchCount, len(a.treeSnap.Nodes))).
+							FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted)
+					}
+					ui.Spacer(c)
+					IconTipBtn(c, p, IconRefresh, 24, 12.5, "刷新分支树", func() {
+						if a.mgr != nil {
+							a.treeSnap = a.mgr.SessionTreeSnapshot()
+						}
+					})
+				})
+
+				if a.treeSnap == nil || len(a.treeSnap.Nodes) == 0 {
+					ui.Column(c).FillWidth().Padding(18, 14).AlignItems(ui.Center).Gap(4).Children(func() {
+						ui.Text(c, "当前会话尚无分支节点").FontSize(FontSmall).TextColor(p.TextSecondary)
+						ui.Text(c, "点击任意消息右侧的分叉按钮重试，或执行 /compact 后将自动生成多分支拓扑。").
+							FontSize(FontCaption).LineHeight(1.5).TextColor(p.TextMuted).TextAlign(ui.Center)
+					})
+					return
+				}
+
+				ui.Scroll(c).MaxHeight(340).FillWidth().Children(func() {
+					ui.Column(c).FillWidth().Padding(6).Children(func() {
+						a.renderTreeNodesList(c, p, a.treeSnap.Nodes)
+					})
+				})
+			})
+		})
+	})
+}
+
 func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 	target := a.mgr.Router().Target()
 	prof := a.cfg.ActiveProfile()
@@ -1161,12 +1873,21 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 	if a.sidebarCollapsed {
 		leftPad = max(bar.Left, 12)
 	}
-	rightPad := float32(14)
-	if !a.termDrawer.Open {
-		rightPad = max(bar.Right, 14)
-	}
+	rightPad := max(bar.Right, 14)
 
-	ui.Column(c).Direction(ui.LeftToRight).Grow(1).MinWidth(0).FillHeight().Clip().Background(p.BgCanvas).Children(func() {
+	mainCol := ui.Column(c).Direction(ui.LeftToRight).Grow(1).MinWidth(0).FillHeight().Clip().Background(p.BgCanvas)
+	fileDragOver := mainCol.FileDragOver()
+	if droppedPaths := mainCol.DroppedFiles(); len(droppedPaths) > 0 {
+		for _, dp := range droppedPaths {
+			_ = a.AddAttachmentFromPath(c, dp)
+		}
+	}
+	if drop, ok := ui.DropData(mainCol, transfer.DropOptions{
+		Formats: []transfer.Format{transfer.FileList, transfer.PNG},
+	}); ok {
+		a.HandleDroppedTransfer(c, drop.Data)
+	}
+	mainCol.Children(func() {
 		// Unified 44px Top Status Bar — Calm, Balanced & Draggable
 		ui.Row(c).FillWidth().MinWidth(0).Height(TopBarHeight).Padding(0, rightPad, 0, leftPad).Gap(8).
 			AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.BorderSubtle).
@@ -1180,17 +1901,21 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 				})
 			}
 
+			maxCrumbW := float32(420)
+			if target.IsRemote {
+				maxCrumbW = 310
+			}
 			// Quiet Clickable Workspace Breadcrumb Pill (Neutral when Local, Purple when Remote SSH)
-			wsBtn := ui.ButtonBase(c).MaxWidth(420).MinWidth(0).Height(26).Padding(0, 10).Radius(RadiusSM).
+			wsBtn := ui.ButtonBase(c).MaxWidth(maxCrumbW).MinWidth(0).Height(26).Padding(0, 10).Radius(RadiusSM).
 				Gap(6).AlignItems(ui.Center).
-				Tooltip("点击管理工作区与远程 SSH 目标")
+				Tooltip("点击管理本地与远程 SSH 工作区")
 			if target.IsRemote {
 				wsBg := p.SSHSoft
 				if wsBtn.Hovered() {
 					wsBg = p.SSHColor.Alpha(0.2)
 				}
 				wsBtn.Background(wsBg).Border(1, p.SSHColor.Alpha(0.28)).Children(func() {
-					ui.Icon(c, IconServer).Size(12, 12).TextColor(p.SSHColor).Shrink(0)
+					ui.Icon(c, IconCloud).Size(13, 13).TextColor(p.SSHColor).Shrink(0)
 					ui.Text(c, "SSH · "+target.DisplaySub()).
 						Font(FontMono).FontWeight(WeightMedium).FontSize(FontCaption + 0.5).TextColor(p.SSHColor).
 						MinWidth(0).SingleLine().Ellipsis("...")
@@ -1212,34 +1937,21 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 				a.settingsModal.Open = true
 			}
 
-			// Branch Count Badge (only shown when conversation has forked into multiple branches)
-			if a.treeSnap != nil && a.treeSnap.BranchCount > 1 {
-				b := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(RadiusSM).
-					Border(1, p.BorderSubtle).Gap(4).AlignItems(ui.Center).
-					Tooltip(fmt.Sprintf("当前会话共 %d 个分支，点击查看分支树", a.treeSnap.BranchCount))
-				bBg := ui.Transparent
-				if b.Hovered() || b.Pressed() {
-					bBg = p.BgHover
-				}
-				b.Background(bBg).Children(func() {
-					ui.Icon(c, IconBranch).Size(12, 12).TextColor(p.Accent)
-					ui.Text(c, fmt.Sprintf("%d", a.treeSnap.BranchCount)).
-						FontFeatures("tnum").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.TextSecondary)
-				})
-				if b.Clicked() {
-					a.sidebarCollapsed = false
-					a.sidebarTab = 1
-				}
+			if target.IsRemote {
+				a.renderSSHStatusPill(c, p)
 			}
 
-			// Context Token Estimate (when conversation has history)
-			if tokens := a.mgr.EstimateContextTokens(); tokens > 0 {
-				ui.Text(c, fmt.Sprintf("~%s tokens", formatTokenCount(tokens))).
-					FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
-			}
+			// Live Git Branch & Uncommitted Changes Pill (Local & Remote SSH)
+			a.renderGitStatusPill(c, p)
+
+			// Session Conversation Branch Popover Pill (shown automatically when chat forks into >1 branches, or opened via Command Palette)
+			a.renderBranchTreePill(c, p)
+
+			// Interactive Context Window Budget & Compaction (/compact) Pill
+			a.renderContextBudgetPill(c, p)
 
 			if a.activeToolStatus != "" {
-				ui.Row(c).MaxWidth(260).MinWidth(0).Padding(2, 8).Radius(RadiusPill).
+				ui.Row(c).MaxWidth(220).MinWidth(0).Padding(2, 8).Radius(RadiusPill).
 					Background(p.AccentSoft).Gap(6).AlignItems(ui.Center).Children(func() {
 					ui.Spinner(c).Size(11, 11)
 					ui.Text(c, a.activeToolStatus).Font(FontMono).FontSize(FontCaption).TextColor(p.Accent).
@@ -1248,6 +1960,35 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 			}
 
 			ui.Spacer(c)
+
+			if mcpTools := a.mgr.MCPActiveToolCount(); mcpTools > 0 {
+				mb := ui.ButtonBase(c).Height(26).Padding(0, 8).Radius(RadiusSM).
+					Border(1, p.BorderSubtle).Gap(4).AlignItems(ui.Center).Shrink(0).
+					Tooltip(fmt.Sprintf("已挂载 %d 个外部 MCP 工具，点击管理 MCP 服务", mcpTools))
+				mBg := ui.Transparent
+				if mb.Hovered() {
+					mBg = p.BgHover
+				}
+				mb.Background(mBg).Children(func() {
+					ui.Icon(c, IconPlug).Size(12, 12).TextColor(p.Accent)
+					ui.Textf(c, "MCP · %d", mcpTools).Font(FontMono).FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextSecondary)
+				})
+				if mb.Clicked() {
+					a.settingsModal.ActiveTab = 3
+					a.settingsModal.Open = true
+				}
+			}
+
+			if len(a.entries) > 0 {
+				IconTipBtn(c, p, IconDownload, 28, 14, "导出当前对话为 Markdown (/export)", func() {
+					a.ExportActiveSession(c, "")
+				})
+			}
+
+			// Command Palette Shortcut Button (Cmd/Ctrl+K)
+			ToolbarIconBtn(c, p, IconCommand, 28, 14, a.cmdPalette.Open, ui.Transparent, "打开快捷命令面板 ("+platformModLabel()+"K)", func() {
+				a.cmdPalette.Toggle()
+			})
 
 			// Safety Policy Icon Button (quiet neutral tint in default mode, semantic tint for overrides)
 			safetyLabel := "远程高危拦截"
@@ -1271,21 +2012,28 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 				a.settingsModal.ActiveTab = 2
 				a.settingsModal.Open = true
 			})
-
-			// Right Terminal Drawer Toggle Icon Button (with unread dot indicator)
-			termTip := "展开实时命令输出流 (Ctrl/Cmd+J)"
-			if a.termDrawer.Open {
-				termTip = "收起实时命令输出流 (Ctrl/Cmd+J)"
-			}
-			termBtn := ToolbarIconBtn(c, p, IconTerminal, 28, 14.5, a.termDrawer.Open, ui.Transparent, termTip, func() {
-				a.termDrawer.Open = !a.termDrawer.Open
-			})
-			if a.termDrawer.Unread && !a.termDrawer.Open {
-				termBtn.DrawOver(func(pt *ui.Painter, r ui.Rect) {
-					pt.Fill(ui.Rect{X: r.X + r.W - 7, Y: r.Y + 4, W: 5, H: 5}, p.Accent, 99)
-				})
-			}
 		})
+
+		// Workspace Project Trust Gate Banner (shown when untrusted .pi/skills exist in repo)
+		if !a.trustBannerDismissed && a.mgr != nil && a.mgr.HasUntrustedProjectSkills() {
+			ui.Row(c).FillWidth().MinWidth(0).Padding(7, 16).Gap(8).AlignItems(ui.Center).
+				Background(p.WarnSoft).BorderWidth(0, 0, 1, 0).BorderColor(p.WarnColor.Alpha(0.35)).Children(func() {
+				ui.Icon(c, IconShieldCheck).Size(14, 14).TextColor(p.WarnColor).Shrink(0)
+				ui.Text(c, "检测到当前工作区包含项目级 .pi/skills 技能配置，出于安全默认未加载。确认仓库来源可信后可启用。").
+					FontSize(FontSmall).TextColor(p.TextPrimary).Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
+				tb := ui.ButtonBase(c).Height(24).Padding(0, 10).Radius(RadiusSM).
+					Background(p.Accent).AlignItems(ui.Center).Shrink(0).Label("信任此工作区")
+				tb.Children(func() {
+					ui.Text(c, "信任此工作区").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(ui.Hex("#FFFFFF"))
+				})
+				if tb.Clicked() {
+					a.TrustActiveWorkspace(c)
+				}
+				IconTipBtn(c, p, IconCross, 24, 13, "暂不加载", func() {
+					a.trustBannerDismissed = true
+				})
+			})
+		}
 
 		// Error alert bar for session/system-level notices
 		if a.lastError != "" {
@@ -1329,8 +2077,10 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 
 			ui.Column(c).FillWidth().MinWidth(0).Margin(topGap, 0, 0, 0).AlignItems(ui.Center).Children(func() {
 				ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Children(func() {
-					RenderChatTurnEntry(c, p, a.entries[i], &a.mdOpts, canFork, showTurnFooter, func(clicked *ChatEntry) {
+					RenderChatTurnEntryWithRevert(c, p, a.entries[i], &a.mdOpts, canFork, showTurnFooter, func(clicked *ChatEntry) {
 						a.forkFromChatEntry(c, clicked)
+					}, func(rev *ChatEntry) {
+						a.RevertToolEntry(c, rev)
 					})
 				})
 			})
@@ -1342,6 +2092,11 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 
 		// Bottom Borderless Unified Floating Composer (.composer-card)
 		ui.Column(c).FillWidth().MinWidth(0).Padding(4, 24, 16, 24).AlignItems(ui.Center).Children(func() {
+			atQuery, atMatches, atActive := a.activeAtAutocompleteMatches()
+			if atActive {
+				a.renderAtAutocompletePanel(c, p, atQuery, atMatches)
+			}
+
 			card := ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).
 				Padding(10, 12, 8, 14).Radius(RadiusLG).
 				Background(p.BgSurface).Gap(8)
@@ -1349,7 +2104,10 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 			focused := card.FocusWithin()
 			borderCol := p.BorderStrong
 			shadowBlur := float32(20)
-			if focused {
+			if fileDragOver {
+				borderCol = p.Accent
+				shadowBlur = 30
+			} else if focused {
 				borderCol = p.BorderFocus
 				shadowBlur = 28
 			}
@@ -1357,7 +2115,9 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 			card.Border(1, borderCol).
 				Shadow(0, 6, shadowBlur, -4, p.ShadowSoft).
 				Children(func() {
-					placeholder := "输入任务指令，Enter 发送，Shift+Enter 换行..."
+					a.renderComposerAttachmentStrip(c, p)
+
+					placeholder := "输入指令（支持 @引用文件、!直连执行命令、粘贴/拖拽附件、/compact 压缩、/export 导出）..."
 					if a.isRunning {
 						placeholder = "Agent 运行中 — 输入纠偏指令按 Enter 将立即触发 Steer 插队引导..."
 					}
@@ -1375,27 +2135,72 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 						FocusRing(false).
 						AutoFocus().
 						OnTextKey(func(k ui.TextKey) bool {
+							if k.Mods == ui.Cmd && k.Key == ui.KeyV {
+								if a.TryPasteClipboardAttachment(c) {
+									return true
+								}
+								return false
+							}
+							if atActive && k.Mods == 0 {
+								switch k.Key {
+								case ui.KeyDown:
+									if len(atMatches) > 0 {
+										a.atSelectedIdx = (a.atSelectedIdx + 1) % len(atMatches)
+									}
+									return true
+								case ui.KeyUp:
+									if len(atMatches) > 0 {
+										a.atSelectedIdx = (a.atSelectedIdx - 1 + len(atMatches)) % len(atMatches)
+									}
+									return true
+								case ui.KeyEscape:
+									a.atDismissedToken = "@" + atQuery
+									return true
+								case ui.KeyTab, ui.KeyEnter:
+									if len(atMatches) > 0 && a.atSelectedIdx >= 0 && a.atSelectedIdx < len(atMatches) {
+										updated := harness.ReplaceActiveAtMention(k.Text(), atMatches[a.atSelectedIdx])
+										k.SetText(updated)
+										a.input = updated
+										a.atSelectedIdx = 0
+										return true
+									}
+								}
+							}
 							if k.Key != ui.KeyEnter || k.Mods != 0 {
 								return false
 							}
 							txt := strings.TrimSpace(k.Text())
-							if txt == "" {
+							if txt == "" && len(a.pendingAttachments) == 0 {
 								return true
 							}
 							k.SetText("")
-							a.submitPrompt(txt)
+							a.submitPromptWithContext(c, txt)
 							return true
 						})
 
-					// Bottom Composer Toolbar — Quiet Unified Cascader Pill + Send/Steer
+					// Bottom Composer Toolbar — Attachment Picker + Cascader Pill + Send/Steer
 					ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+						attBtn := ui.ButtonBase(c).Size(26, 26).Radius(RadiusPill).
+							Border(1, p.BorderSubtle).AlignItems(ui.Center).Justify(ui.Center).
+							Tooltip("添加图片或代码文件附件（支持拖拽文件或粘贴截图）").Label("添加附件")
+						attBg := p.InputBg
+						if attBtn.Hovered() || attBtn.Pressed() {
+							attBg = p.BgHover
+						}
+						attBtn.Background(attBg).Children(func() {
+							ui.Icon(c, IconPaperclip).Size(12.5, 12.5).TextColor(p.TextSecondary)
+						})
+						if attBtn.Clicked() {
+							a.TriggerPickAttachments()
+						}
+
 						if prof != nil {
 							a.renderUnifiedCascaderPill(c, p, prof)
 						}
 
 						ui.Spacer(c)
 
-						hasInput := strings.TrimSpace(a.input) != ""
+						hasInput := strings.TrimSpace(a.input) != "" || len(a.pendingAttachments) > 0
 						if hasInput {
 							hint := "Enter 发送"
 							if a.isRunning {
@@ -1455,7 +2260,7 @@ func (a *DeskApp) renderCenterMain(c *ui.Context, p Palette) {
 							ui.Icon(c, btnIcon).Size(iconSz, iconSz).TextColor(btnFg)
 						})
 						if sendBtn.Clicked() {
-							a.submitPrompt(a.input)
+							a.submitPromptWithContext(c, a.input)
 						}
 					})
 				})
@@ -1474,9 +2279,9 @@ func (a *DeskApp) renderWelcomeEmptyState(c *ui.Context, p Palette) {
 		})
 
 		ui.Column(c).AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Text(c, "大脑在本地，手脚可插拔").
+			ui.Text(c, "本地项目与远程服务器，同一套原生工作台").
 				FontWeight(WeightSemibold).FontSize(FontHero).TextColor(p.TextPrimary)
-			ui.Text(c, "同一会话支持随时热切换本地项目与远程 SSH 服务器，内置树状会话分叉回溯与高危命令拦截审批。").
+			ui.Text(c, "支持打开本地代码仓库或连接远程 SSH 开发机。各工作区拥有独立隔离的树状会话、专属 AGENTS.md 与 Skills 上下文，并内置高危操作审批拦截。").
 				FontSize(FontBody).LineHeight(1.6).TextColor(p.TextMuted).TextAlign(ui.Center)
 		})
 
@@ -1485,7 +2290,7 @@ func (a *DeskApp) renderWelcomeEmptyState(c *ui.Context, p Palette) {
 			renderQuickActionChip(c, p, IconCompass, "扫描当前项目架构", func() {
 				a.input = "请先扫描当前工作区的目录结构与关键模块，给出一份简明的架构概览。"
 			})
-			renderQuickActionChip(c, p, IconServer, "工作区与 SSH 目标", func() {
+			renderQuickActionChip(c, p, IconServer, "切换本地 / SSH 工作区", func() {
 				a.settingsModal.ActiveTab = 1
 				a.settingsModal.Open = true
 			})

@@ -1,14 +1,16 @@
 package store
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sky-valley/pi/coding"
 )
 
 // APIFormat defines the wire protocol format for the custom LLM endpoint.
@@ -25,7 +27,7 @@ type SafetyPolicy string
 
 const (
 	// SafetyPolicyRemoteHighRisk intercepts high-risk bash/write/edit on remote SSH hosts,
-	// and critical destructive commands (e.g. rm -rf /, mkfs, dd, shutdown) locally.
+	// and critical destructive commands (e.g. rm -rf /, mkfs, dd, shutdown, ~/.ssh, /etc) locally.
 	SafetyPolicyRemoteHighRisk SafetyPolicy = "remote-high-risk"
 	// SafetyPolicyAlwaysHighRisk intercepts high-risk bash/write/edit in both local and remote environments.
 	SafetyPolicyAlwaysHighRisk SafetyPolicy = "always-high-risk"
@@ -40,16 +42,159 @@ const (
 	ThemeLight = "light"
 )
 
+// MCPTransport defines the wire transport for an external Model Context Protocol (MCP) server.
+type MCPTransport string
+
+const (
+	MCPTransportStdio MCPTransport = "stdio"
+	MCPTransportHTTP  MCPTransport = "http"
+)
+
+// MCPServerConfig describes a configured Stdio or Streamable HTTP MCP server.
+type MCPServerConfig struct {
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Transport      MCPTransport      `json:"transport"`
+	Enabled        bool              `json:"enabled"`
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	BearerToken    string            `json:"bearer_token,omitempty"`
+	KeychainStored bool              `json:"keychain_stored,omitempty"`
+}
+
+// DisplayEndpoint returns a concise monospace summary of the server's command or URL.
+func (s MCPServerConfig) DisplayEndpoint() string {
+	if s.Transport == MCPTransportHTTP {
+		return strings.TrimSpace(s.URL)
+	}
+	parts := append([]string{strings.TrimSpace(s.Command)}, s.Args...)
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+// Clone returns a deep copy of MCPServerConfig.
+func (s MCPServerConfig) Clone() MCPServerConfig {
+	cp := s
+	if len(s.Args) > 0 {
+		cp.Args = make([]string, len(s.Args))
+		copy(cp.Args, s.Args)
+	}
+	if len(s.Env) > 0 {
+		cp.Env = make(map[string]string, len(s.Env))
+		for k, v := range s.Env {
+			cp.Env[k] = v
+		}
+	}
+	if len(s.Headers) > 0 {
+		cp.Headers = make(map[string]string, len(s.Headers))
+		for k, v := range s.Headers {
+			cp.Headers[k] = v
+		}
+	}
+	return cp
+}
+
+// ParseCommandLine splits a command line (supporting single/double quotes and backslash escapes)
+// into an executable name and argument slice.
+func ParseCommandLine(line string) (cmd string, args []string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", nil
+	}
+	var tokens []string
+	var cur strings.Builder
+	var quote rune
+	inToken := false
+	escaped := false
+
+	for _, r := range line {
+		if escaped {
+			cur.WriteRune(r)
+			escaped = false
+			inToken = true
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			inToken = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+			inToken = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			inToken = true
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if inToken {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+			continue
+		}
+		cur.WriteRune(r)
+		inToken = true
+	}
+	if inToken {
+		tokens = append(tokens, cur.String())
+	}
+	if len(tokens) == 0 {
+		return "", nil
+	}
+	return tokens[0], tokens[1:]
+}
+
+// ParseKeyValuePairs parses KEY=VALUE entries separated by newlines or semicolons.
+func ParseKeyValuePairs(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	out := map[string]string{}
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	for _, chunk := range strings.FieldsFunc(normalized, func(r rune) bool { return r == '\n' || r == ';' }) {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" || strings.HasPrefix(chunk, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(chunk, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		if k != "" {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // ProviderProfile holds connection settings for an OpenAI or Anthropic compatible endpoint.
 type ProviderProfile struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Format        APIFormat `json:"format"`
-	BaseURL       string    `json:"base_url"`
-	APIKey        string    `json:"api_key"`
-	ModelID       string    `json:"model_id"`
-	Models        []string  `json:"models,omitempty"`
-	ThinkingLevel string    `json:"thinking_level"` // "off", "low", "medium", "high"
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Format         APIFormat `json:"format"`
+	BaseURL        string    `json:"base_url"`
+	APIKey         string    `json:"api_key,omitempty"`
+	KeychainStored bool      `json:"keychain_stored,omitempty"`
+	ModelID        string    `json:"model_id"`
+	Models         []string  `json:"models,omitempty"`
+	ThinkingLevel  string    `json:"thinking_level"` // "off", "low", "medium", "high"
 }
 
 // AvailableModels returns the deduplicated list of models configured for this channel,
@@ -131,16 +276,17 @@ func (p *ProviderProfile) RemoveModel(modelID string) {
 	}
 }
 
-// WorkspaceTarget abstracts a local project directory or a remote SSH workspace.
+// WorkspaceTarget abstracts a first-class Local project directory or Remote SSH project directory.
 type WorkspaceTarget struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	IsRemote bool   `json:"is_remote"`
 	WorkDir  string `json:"work_dir"`
-	SSHHost  string `json:"ssh_host,omitempty"` // ~/.ssh/config alias or user@host:port
+	SSHHost  string `json:"ssh_host,omitempty"` // ~/.ssh/config alias or user@host
+	Trusted  bool   `json:"trusted,omitempty"`  // Whether project-local .pi/skills are trusted
 }
 
-// ShortName returns a concise target name suitable for badges and sidebar headers.
+// ShortName returns a concise workspace name suitable for badges and sidebar headers.
 func (t WorkspaceTarget) ShortName() string {
 	name := strings.TrimSpace(t.Name)
 	if strings.HasPrefix(name, "本机当前目录 (") && strings.HasSuffix(name, ")") {
@@ -159,6 +305,13 @@ func (t WorkspaceTarget) ShortName() string {
 		return name
 	}
 	if t.IsRemote {
+		wd := strings.TrimSpace(t.WorkDir)
+		if wd != "" && wd != "~" && wd != "/" {
+			base := path.Base(strings.TrimRight(wd, "/"))
+			if base != "" && base != "." && base != "~" {
+				return base
+			}
+		}
 		if t.SSHHost != "" {
 			return t.SSHHost
 		}
@@ -170,14 +323,14 @@ func (t WorkspaceTarget) ShortName() string {
 	return "local"
 }
 
-// DisplaySub returns the secondary monospace path/host description for sidebar target cards.
+// DisplaySub returns the secondary monospace path/host description for sidebar workspace cards.
 func (t WorkspaceTarget) DisplaySub() string {
 	if t.IsRemote {
 		wd := strings.TrimSpace(t.WorkDir)
 		if wd == "" {
 			wd = "~"
 		}
-		return t.SSHHost + ":" + wd
+		return strings.TrimSpace(t.SSHHost) + ":" + wd
 	}
 	return ShortenHomePath(t.WorkDir)
 }
@@ -198,6 +351,81 @@ func (t WorkspaceTarget) ToolCardBadge() string {
 	return "Local · " + t.ShortName()
 }
 
+// SessionScopeCwd returns the deterministic scope path passed to coding.StartSession and
+// coding.ListSessions so each Local or Remote SSH workspace owns an isolated session list.
+// Local workspaces map directly to their absolute directory path (100% compatible with pi CLI).
+// Remote SSH workspaces map to a synthetic rooted POSIX path "/__piui_ssh__/<host>/<workdir>"
+// that coding.DefaultSessionDir encodes safely under ~/.pi/agent/sessions/ without touching "/".
+func (t WorkspaceTarget) SessionScopeCwd() string {
+	if !t.IsRemote {
+		wd := ExpandLocalPath(strings.TrimSpace(t.WorkDir))
+		if wd == "" {
+			wd, _ = os.Getwd()
+		}
+		if abs, err := filepath.Abs(wd); err == nil {
+			return abs
+		}
+		return wd
+	}
+
+	host := sanitizeScopeSegment(t.SSHHost)
+	if host == "" {
+		host = "remote"
+	}
+	wd := strings.TrimSpace(t.WorkDir)
+	if wd == "" || wd == "~" {
+		wd = "home"
+	} else if strings.HasPrefix(wd, "~/") {
+		wd = "home/" + strings.TrimPrefix(wd, "~/")
+	} else {
+		wd = strings.TrimPrefix(path.Clean(wd), "/")
+	}
+	if wd == "" || wd == "." {
+		wd = "root"
+	}
+	return "/__piui_ssh__/" + host + "/" + wd
+}
+
+func sanitizeScopeSegment(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == '@':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+// SameLocation reports whether two WorkspaceTargets refer to the same physical directory/host.
+func (t WorkspaceTarget) SameLocation(other WorkspaceTarget) bool {
+	if t.IsRemote != other.IsRemote {
+		return false
+	}
+	if t.IsRemote {
+		w1 := normalizeRemoteWorkDir(t.WorkDir)
+		w2 := normalizeRemoteWorkDir(other.WorkDir)
+		return strings.EqualFold(strings.TrimSpace(t.SSHHost), strings.TrimSpace(other.SSHHost)) && w1 == w2
+	}
+	p1 := filepath.Clean(ExpandLocalPath(t.WorkDir))
+	p2 := filepath.Clean(ExpandLocalPath(other.WorkDir))
+	return p1 == p2
+}
+
+func normalizeRemoteWorkDir(wd string) string {
+	wd = strings.TrimSpace(wd)
+	if wd == "" || wd == "~" || wd == "~/" {
+		return "~"
+	}
+	if strings.HasPrefix(wd, "~/") {
+		return "~/" + strings.TrimPrefix(path.Clean("/"+wd[2:]), "/")
+	}
+	return path.Clean(wd)
+}
+
 // ShortenHomePath replaces the local user's home directory prefix with "~".
 func ShortenHomePath(p string) string {
 	p = strings.TrimSpace(p)
@@ -215,14 +443,22 @@ func ShortenHomePath(p string) string {
 	return p
 }
 
+// LoadOptions controls startup workspace resolution behavior.
+type LoadOptions struct {
+	StartupDir         string
+	ExplicitStartupDir bool // True when user explicitly passed `piui /path/to/dir` on CLI
+}
+
 // AppConfig is persisted to ~/.config/piui/config.json (or PIUI_CONFIG_PATH).
 type AppConfig struct {
 	ActiveProfileID string            `json:"active_profile_id"`
 	Profiles        []ProviderProfile `json:"profiles"`
 	ActiveTargetID  string            `json:"active_target_id"`
 	Targets         []WorkspaceTarget `json:"targets"`
+	MCPServers      []MCPServerConfig `json:"mcp_servers,omitempty"`
 	SafetyPolicy    SafetyPolicy      `json:"safety_policy,omitempty"`
-	Theme           string            `json:"theme,omitempty"` // "dark" (default) or "light"
+	Theme           string            `json:"theme,omitempty"`          // "dark" (default) or "light"
+	SessionTitles   map[string]string `json:"session_titles,omitempty"` // Custom renamed titles keyed by session UUID
 
 	configPath  string `json:"-"`
 	LoadWarning string `json:"-"`
@@ -248,6 +484,207 @@ func (c *AppConfig) ToggleTheme() string {
 		c.Theme = ThemeLight
 	}
 	return c.Theme
+}
+
+// SessionTitle returns the user's custom title for sessionID if set, or fallback otherwise.
+func (c *AppConfig) SessionTitle(sessionID, fallback string) string {
+	if c != nil && c.SessionTitles != nil {
+		if custom := strings.TrimSpace(c.SessionTitles[strings.TrimSpace(sessionID)]); custom != "" {
+			return custom
+		}
+	}
+	return fallback
+}
+
+// SetSessionTitle sets or clears a custom title override for sessionID.
+func (c *AppConfig) SetSessionTitle(sessionID, title string) {
+	if c == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		delete(c.SessionTitles, sessionID)
+		return
+	}
+	if c.SessionTitles == nil {
+		c.SessionTitles = make(map[string]string)
+	}
+	c.SessionTitles[sessionID] = title
+}
+
+// DeleteSessionTitle removes any custom title stored for sessionID.
+func (c *AppConfig) DeleteSessionTitle(sessionID string) {
+	if c == nil || c.SessionTitles == nil {
+		return
+	}
+	delete(c.SessionTitles, strings.TrimSpace(sessionID))
+}
+
+// UpsertMCPServer adds or updates an MCPServerConfig entry.
+func (c *AppConfig) UpsertMCPServer(srv MCPServerConfig) MCPServerConfig {
+	srv.Name = strings.TrimSpace(srv.Name)
+	if srv.Transport != MCPTransportHTTP {
+		srv.Transport = MCPTransportStdio
+	}
+	if srv.Name == "" {
+		if srv.Transport == MCPTransportHTTP && strings.TrimSpace(srv.URL) != "" {
+			srv.Name = strings.TrimSpace(srv.URL)
+		} else if strings.TrimSpace(srv.Command) != "" {
+			srv.Name = filepath.Base(strings.TrimSpace(srv.Command))
+		} else {
+			srv.Name = "mcp-server"
+		}
+	}
+	if strings.TrimSpace(srv.ID) == "" {
+		srv.ID = fmt.Sprintf("mcp-%d", time.Now().UnixNano()%1000000)
+	}
+	for i := range c.MCPServers {
+		if c.MCPServers[i].ID == srv.ID {
+			c.MCPServers[i] = srv.Clone()
+			return c.MCPServers[i]
+		}
+	}
+	c.MCPServers = append(c.MCPServers, srv.Clone())
+	return srv
+}
+
+// RemoveMCPServer deletes an MCP server by ID and cleans up any Keychain secret associated with it.
+func (c *AppConfig) RemoveMCPServer(id string) bool {
+	if c == nil {
+		return false
+	}
+	idx := -1
+	for i := range c.MCPServers {
+		if c.MCPServers[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return false
+	}
+	if sec := ActiveSecretStore(); sec != nil {
+		_ = sec.Delete("mcp:" + id)
+	}
+	c.MCPServers = append(c.MCPServers[:idx], c.MCPServers[idx+1:]...)
+	return true
+}
+
+// UpsertLocalTarget adds a local directory workspace (or updates an existing matching location)
+// and optionally activates it.
+func (c *AppConfig) UpsertLocalTarget(workDir, name string, makeActive bool) WorkspaceTarget {
+	workDir = ExpandLocalPath(strings.TrimSpace(workDir))
+	if abs, err := filepath.Abs(workDir); err == nil {
+		workDir = abs
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = filepath.Base(workDir)
+	}
+	candidate := WorkspaceTarget{
+		Name:     name,
+		IsRemote: false,
+		WorkDir:  workDir,
+	}
+	for i := range c.Targets {
+		if c.Targets[i].SameLocation(candidate) {
+			if strings.TrimSpace(name) != "" && c.Targets[i].ID != "local-cwd" {
+				c.Targets[i].Name = name
+			}
+			if makeActive {
+				c.ActiveTargetID = c.Targets[i].ID
+			}
+			return c.Targets[i]
+		}
+	}
+	candidate.ID = fmt.Sprintf("local-%d", time.Now().UnixNano()%1000000)
+	c.Targets = append(c.Targets, candidate)
+	if makeActive {
+		c.ActiveTargetID = candidate.ID
+	}
+	return candidate
+}
+
+// UpsertSSHTarget adds a remote SSH workspace (or selects an existing matching host:dir)
+// and optionally activates it.
+func (c *AppConfig) UpsertSSHTarget(sshHost, workDir, name string, makeActive bool) WorkspaceTarget {
+	sshHost = strings.TrimSpace(sshHost)
+	workDir = normalizeRemoteWorkDir(workDir)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		if workDir != "~" && workDir != "/" {
+			base := path.Base(strings.TrimRight(workDir, "/"))
+			if base != "" && base != "." {
+				name = base + " (" + sshHost + ")"
+			}
+		}
+		if name == "" {
+			name = sshHost
+		}
+	}
+	candidate := WorkspaceTarget{
+		Name:     name,
+		IsRemote: true,
+		WorkDir:  workDir,
+		SSHHost:  sshHost,
+	}
+	for i := range c.Targets {
+		if c.Targets[i].SameLocation(candidate) {
+			if strings.TrimSpace(name) != "" {
+				c.Targets[i].Name = name
+			}
+			if makeActive {
+				c.ActiveTargetID = c.Targets[i].ID
+			}
+			return c.Targets[i]
+		}
+	}
+	candidate.ID = fmt.Sprintf("ssh-%d", time.Now().UnixNano()%1000000)
+	c.Targets = append(c.Targets, candidate)
+	if makeActive {
+		c.ActiveTargetID = candidate.ID
+	}
+	return candidate
+}
+
+// RemoveTarget deletes a workspace target by ID while keeping at least one workspace present.
+func (c *AppConfig) RemoveTarget(targetID string) bool {
+	if c == nil || len(c.Targets) <= 1 {
+		return false
+	}
+	idx := -1
+	for i := range c.Targets {
+		if c.Targets[i].ID == targetID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return false
+	}
+	c.Targets = append(c.Targets[:idx], c.Targets[idx+1:]...)
+	if c.ActiveTargetID == targetID {
+		c.ActiveTargetID = c.Targets[0].ID
+	}
+	return true
+}
+
+// SetTargetTrusted updates the Trusted flag on the given workspace target ID.
+func (c *AppConfig) SetTargetTrusted(targetID string, trusted bool) bool {
+	if c == nil {
+		return false
+	}
+	for i := range c.Targets {
+		if c.Targets[i].ID == targetID {
+			c.Targets[i].Trusted = trusted
+			return true
+		}
+	}
+	return false
 }
 
 // ConfigPath returns the path to ~/.config/piui/config.json, honoring PIUI_CONFIG_PATH if set.
@@ -283,7 +720,7 @@ func defaultProfiles() []ProviderProfile {
 			Name:          "Anthropic / 兼容接口",
 			Format:        FormatAnthropicMessages,
 			BaseURL:       strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")),
-			APIKey:        strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
+			APIKey:        "",
 			ModelID:       "claude-sonnet-4-5",
 			Models:        []string{"claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"},
 			ThinkingLevel: "medium",
@@ -293,7 +730,7 @@ func defaultProfiles() []ProviderProfile {
 			Name:          "OpenAI Chat / 聚合网关",
 			Format:        FormatOpenAICompletions,
 			BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
-			APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+			APIKey:        "",
 			ModelID:       "gpt-4.1",
 			Models:        []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o4-mini"},
 			ThinkingLevel: "medium",
@@ -303,7 +740,7 @@ func defaultProfiles() []ProviderProfile {
 			Name:          "OpenAI Responses API",
 			Format:        FormatOpenAIResponses,
 			BaseURL:       strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
-			APIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+			APIKey:        "",
 			ModelID:       "gpt-5",
 			Models:        []string{"gpt-5", "gpt-5-mini", "o3", "gpt-4.1"},
 			ThinkingLevel: "medium",
@@ -318,16 +755,27 @@ func newDefaultConfig(path, defaultWorkDir string) AppConfig {
 		SafetyPolicy:    SafetyPolicyRemoteHighRisk,
 		Theme:           ThemeDark,
 		Profiles:        defaultProfiles(),
+		SessionTitles:   map[string]string{},
 	}
 	cfg.ensureProfiles()
-	cfg.ensureTargets(defaultWorkDir)
+	cfg.ensureTargets(defaultWorkDir, true)
 	return cfg
 }
 
-// LoadOrInit loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) or initializes defaults
-// only when the file does not exist yet. If an existing file cannot be read or contains
-// corrupted JSON, it preserves/backs up the file without overwriting it and records LoadWarning.
+// LoadOrInit loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) using defaultWorkDir
+// as an explicit CLI startup workspace.
 func LoadOrInit(defaultWorkDir string) *AppConfig {
+	return LoadOrInitWithOptions(LoadOptions{
+		StartupDir:         defaultWorkDir,
+		ExplicitStartupDir: strings.TrimSpace(defaultWorkDir) != "",
+	})
+}
+
+// LoadOrInitWithOptions loads ~/.config/piui/config.json (or PIUI_CONFIG_PATH) or initializes
+// defaults only when the file does not exist yet. If an existing file cannot be read or contains
+// corrupted JSON, it preserves/backs up the file without overwriting it and records LoadWarning.
+func LoadOrInitWithOptions(opts LoadOptions) *AppConfig {
+	defaultWorkDir := strings.TrimSpace(opts.StartupDir)
 	if defaultWorkDir == "" {
 		defaultWorkDir, _ = os.Getwd()
 	}
@@ -346,7 +794,6 @@ func LoadOrInit(defaultWorkDir string) *AppConfig {
 			}
 			return &cfg
 		}
-		// Existing file could not be read (e.g. permission denied): do NOT overwrite it.
 		cfg.LoadWarning = fmt.Sprintf("读取配置文件 %s 失败: %v（已使用临时默认配置启动，原文件未被覆盖）", ShortenHomePath(path), err)
 		return &cfg
 	}
@@ -371,9 +818,40 @@ func LoadOrInit(defaultWorkDir string) *AppConfig {
 	}
 
 	cfg.configPath = path
+	cfg.hydrateSecrets()
 	cfg.ensureProfiles()
-	cfg.ensureTargets(defaultWorkDir)
+	pruned := cfg.ensureTargets(defaultWorkDir, opts.ExplicitStartupDir)
+	if pruned {
+		_ = cfg.Save()
+	}
 	return &cfg
+}
+
+func (c *AppConfig) hydrateSecrets() {
+	sec := ActiveSecretStore()
+	if sec == nil {
+		return
+	}
+	for i := range c.Profiles {
+		p := &c.Profiles[i]
+		if p.KeychainStored && strings.TrimSpace(p.APIKey) == "" {
+			if secretVal, err := sec.Get(p.ID); err == nil && strings.TrimSpace(secretVal) != "" {
+				p.APIKey = strings.TrimSpace(secretVal)
+			} else if errors.Is(err, ErrSecretNotFound) {
+				p.KeychainStored = false
+			}
+		}
+	}
+	for i := range c.MCPServers {
+		ms := &c.MCPServers[i]
+		if ms.KeychainStored && strings.TrimSpace(ms.BearerToken) == "" {
+			if secretVal, err := sec.Get("mcp:" + ms.ID); err == nil && strings.TrimSpace(secretVal) != "" {
+				ms.BearerToken = strings.TrimSpace(secretVal)
+			} else if errors.Is(err, ErrSecretNotFound) {
+				ms.KeychainStored = false
+			}
+		}
+	}
 }
 
 // Clone returns a deep copy of AppConfig suitable for modal draft editing.
@@ -393,6 +871,18 @@ func (c *AppConfig) Clone() AppConfig {
 	}
 	cp.Targets = make([]WorkspaceTarget, len(c.Targets))
 	copy(cp.Targets, c.Targets)
+	if len(c.MCPServers) > 0 {
+		cp.MCPServers = make([]MCPServerConfig, len(c.MCPServers))
+		for i, ms := range c.MCPServers {
+			cp.MCPServers[i] = ms.Clone()
+		}
+	}
+	if len(c.SessionTitles) > 0 {
+		cp.SessionTitles = make(map[string]string, len(c.SessionTitles))
+		for k, v := range c.SessionTitles {
+			cp.SessionTitles[k] = v
+		}
+	}
 	return cp
 }
 
@@ -422,46 +912,68 @@ func (c *AppConfig) ensureProfiles() {
 	}
 }
 
-func (c *AppConfig) ensureTargets(defaultWorkDir string) {
-	localCwdTarget := WorkspaceTarget{
-		ID:       "local-cwd",
-		Name:     "本机当前目录 (" + filepath.Base(defaultWorkDir) + ")",
-		IsRemote: false,
-		WorkDir:  defaultWorkDir,
+// isLegacyAutoScannedSSHTarget identifies SSH entries that an earlier version of PiUI
+// automatically populated from ~/.ssh/config (ID="ssh-<host>", Name="SSH: <host>", WorkDir="~",
+// untrusted, and with zero recorded sessions). SSH workspaces are strictly manual-only now.
+func isLegacyAutoScannedSSHTarget(t WorkspaceTarget) bool {
+	host := strings.TrimSpace(t.SSHHost)
+	if !t.IsRemote || host == "" || t.Trusted {
+		return false
 	}
+	if t.ID != "ssh-"+host || strings.TrimSpace(t.Name) != "SSH: "+host {
+		return false
+	}
+	if normalizeRemoteWorkDir(t.WorkDir) != "~" {
+		return false
+	}
+	sessions := coding.ListSessions(t.SessionScopeCwd(), strings.TrimSpace(os.Getenv("PIUI_SESSION_DIR")))
+	return len(sessions) == 0
+}
 
-	foundLocalCwd := false
+func (c *AppConfig) ensureTargets(defaultWorkDir string, explicitStartupDir bool) bool {
+	prunedLegacy := false
+	cleaned := make([]WorkspaceTarget, 0, len(c.Targets))
 	for i := range c.Targets {
-		if !c.Targets[i].IsRemote && c.Targets[i].WorkDir != "" {
-			c.Targets[i].WorkDir = ExpandLocalPath(c.Targets[i].WorkDir)
+		t := c.Targets[i]
+		if !t.IsRemote && t.WorkDir != "" {
+			t.WorkDir = ExpandLocalPath(t.WorkDir)
+		} else if t.IsRemote {
+			t.WorkDir = normalizeRemoteWorkDir(t.WorkDir)
 		}
-		if c.Targets[i].ID == "local-cwd" {
-			c.Targets[i] = localCwdTarget
-			foundLocalCwd = true
-		}
-	}
-	if !foundLocalCwd {
-		c.Targets = append([]WorkspaceTarget{localCwdTarget}, c.Targets...)
-	}
-
-	// Merge SSH hosts discovered from ~/.ssh/config if not already present.
-	existingSSH := map[string]bool{}
-	for _, t := range c.Targets {
-		if t.IsRemote && t.SSHHost != "" {
-			existingSSH[t.SSHHost] = true
-		}
-	}
-	for _, host := range DiscoverSSHConfigHosts() {
-		if existingSSH[host] {
+		if isLegacyAutoScannedSSHTarget(t) {
+			prunedLegacy = true
 			continue
 		}
-		c.Targets = append(c.Targets, WorkspaceTarget{
-			ID:       "ssh-" + host,
-			Name:     "SSH: " + host,
-			IsRemote: true,
-			WorkDir:  "~",
-			SSHHost:  host,
-		})
+		cleaned = append(cleaned, t)
+	}
+	c.Targets = cleaned
+
+	if defaultWorkDir != "" && (explicitStartupDir || len(c.Targets) == 0) {
+		localCwdTarget := WorkspaceTarget{
+			ID:       "local-cwd",
+			Name:     "本机当前目录 (" + filepath.Base(defaultWorkDir) + ")",
+			IsRemote: false,
+			WorkDir:  defaultWorkDir,
+		}
+		foundIdx := -1
+		for i := range c.Targets {
+			if c.Targets[i].ID == "local-cwd" {
+				// Preserve user's Trusted flag if reopening the exact same directory!
+				if c.Targets[i].SameLocation(localCwdTarget) {
+					localCwdTarget.Trusted = c.Targets[i].Trusted
+				}
+				c.Targets[i] = localCwdTarget
+				foundIdx = i
+				break
+			}
+			if c.Targets[i].SameLocation(localCwdTarget) {
+				foundIdx = i
+				break
+			}
+		}
+		if foundIdx == -1 {
+			c.Targets = append([]WorkspaceTarget{localCwdTarget}, c.Targets...)
+		}
 	}
 
 	// Ensure ActiveTargetID references an existing target.
@@ -481,10 +993,13 @@ func (c *AppConfig) ensureTargets(defaultWorkDir string) {
 	if !strings.EqualFold(c.Theme, ThemeLight) {
 		c.Theme = ThemeDark
 	}
+	return prunedLegacy
 }
 
 // Save atomically writes the configuration to ~/.config/piui/config.json (or the configured path)
 // via a same-directory 0600 temporary file, fsync, and atomic rename.
+// When a SecretStore (OS Keychain) is active, API keys are stored in the OS Keychain and scrubbed
+// from the serialized JSON file on disk while remaining populated in memory.
 func (c *AppConfig) Save() error {
 	path := c.configPath
 	if path == "" {
@@ -495,7 +1010,52 @@ func (c *AppConfig) Save() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(c, "", "  ")
+
+	diskCopy := c.Clone()
+	if sec := ActiveSecretStore(); sec != nil {
+		for i := range diskCopy.Profiles {
+			dp := &diskCopy.Profiles[i]
+			memKey := strings.TrimSpace(c.Profiles[i].APIKey)
+			if memKey != "" {
+				if err := sec.Set(dp.ID, memKey); err == nil {
+					dp.APIKey = ""
+					dp.KeychainStored = true
+					c.Profiles[i].KeychainStored = true
+				} else {
+					// Graceful fallback (e.g. headless Linux server with no D-Bus keyring): keep in 0600 JSON.
+					dp.KeychainStored = false
+					c.Profiles[i].KeychainStored = false
+				}
+			} else {
+				_ = sec.Delete(dp.ID)
+				dp.APIKey = ""
+				dp.KeychainStored = false
+				c.Profiles[i].KeychainStored = false
+			}
+		}
+		for i := range diskCopy.MCPServers {
+			dms := &diskCopy.MCPServers[i]
+			memTok := strings.TrimSpace(c.MCPServers[i].BearerToken)
+			secKey := "mcp:" + dms.ID
+			if memTok != "" {
+				if err := sec.Set(secKey, memTok); err == nil {
+					dms.BearerToken = ""
+					dms.KeychainStored = true
+					c.MCPServers[i].KeychainStored = true
+				} else {
+					dms.KeychainStored = false
+					c.MCPServers[i].KeychainStored = false
+				}
+			} else {
+				_ = sec.Delete(secKey)
+				dms.BearerToken = ""
+				dms.KeychainStored = false
+				c.MCPServers[i].KeychainStored = false
+			}
+		}
+	}
+
+	data, err := json.MarshalIndent(&diskCopy, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -561,40 +1121,4 @@ func (c *AppConfig) ActiveTarget() *WorkspaceTarget {
 		return &c.Targets[0]
 	}
 	return nil
-}
-
-// DiscoverSSHConfigHosts parses concrete Host aliases from ~/.ssh/config.
-func DiscoverSSHConfigHosts() []string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return nil
-	}
-	f, err := os.Open(filepath.Join(home, ".ssh", "config"))
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var hosts []string
-	seen := map[string]bool{}
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "Host") {
-			for _, alias := range fields[1:] {
-				if strings.ContainsAny(alias, "*?!") {
-					continue
-				}
-				if !seen[alias] {
-					seen[alias] = true
-					hosts = append(hosts, alias)
-				}
-			}
-		}
-	}
-	return hosts
 }

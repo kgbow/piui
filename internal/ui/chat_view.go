@@ -12,6 +12,7 @@ import (
 	"github.com/sky-valley/pi/ai"
 
 	"piui/internal/harness"
+	"piui/internal/mcp"
 )
 
 // EntryKind distinguishes user prompts, assistant markdown replies, and tool execution cards.
@@ -23,11 +24,19 @@ const (
 	EntryTool
 )
 
+// ChatAttachmentBadge represents an attached image or file chip shown on a user message bubble.
+type ChatAttachmentBadge struct {
+	Name    string
+	IsImage bool
+	Bitmap  *ui.Bitmap
+}
+
 // ChatEntry represents one item in the central conversation timeline.
 type ChatEntry struct {
 	ID              int
 	Kind            EntryKind
 	Text            string
+	Attachments     []ChatAttachmentBadge
 	Thinking        string
 	ThinkOpen       bool
 	Steered         bool
@@ -39,12 +48,23 @@ type ChatEntry struct {
 	EntryID         string // JSONL tree entry ID for branching/checkout
 	ParentEntryID   string // JSONL parent entry ID right before this message
 
+	// Assistant turn token & latency metrics
+	InputTokens     int
+	OutputTokens    int
+	CacheReadTokens int
+	TurnDurationMs  int64
+
 	// Tool call fields
 	ToolCallID  string
 	ToolName    string
 	ToolSummary string
 	DiffOld     string
 	DiffNew     string
+	DiffLines   []harness.DiffLine
+	DiffAdded   int
+	DiffRemoved int
+	CanRevert   bool
+	Reverted    bool
 	ToolOutput  string
 	ToolRunning bool
 	ToolError   bool
@@ -55,6 +75,7 @@ type ChatEntry struct {
 // IsEmpty returns true if an assistant entry has no text, thinking, or error content.
 func (e *ChatEntry) IsEmpty() bool {
 	return strings.TrimSpace(e.Text) == "" &&
+		len(e.Attachments) == 0 &&
 		strings.TrimSpace(e.Thinking) == "" &&
 		strings.TrimSpace(e.ErrorText) == ""
 }
@@ -101,6 +122,18 @@ func SyncAssistantEntryFromMessage(entry *ChatEntry, msg agent.AgentMessage) {
 	if am.ErrorMessage != "" && entry.ErrorText == "" {
 		entry.ErrorText = am.ErrorMessage
 	}
+	if am.Usage.Input > 0 {
+		entry.InputTokens = am.Usage.Input
+	}
+	if am.Usage.Output > 0 {
+		entry.OutputTokens = am.Usage.Output
+	}
+	if am.Usage.CacheRead > 0 {
+		entry.CacheReadTokens = am.Usage.CacheRead
+	}
+	if am.DurationMs != nil && *am.DurationMs > 0 {
+		entry.TurnDurationMs = *am.DurationMs
+	}
 	if entry.Text == "" || entry.Thinking == "" {
 		var textParts, thinkParts []string
 		for _, block := range am.Content {
@@ -146,6 +179,9 @@ func toolVisualMeta(toolName string) (*ui.SVG, string) {
 	case "workspace_probe":
 		return IconCompass, "probe"
 	default:
+		if srv, tl, ok := mcp.ParseMCPAgentToolName(toolName); ok {
+			return IconPlug, fmt.Sprintf("mcp:%s/%s", srv, tl)
+		}
 		return IconCode, toolName
 	}
 }
@@ -158,6 +194,20 @@ func RenderChatEntryWithActions(c *ui.Context, p Palette, entry *ChatEntry, mdOp
 // RenderChatTurnEntry renders a single ChatEntry with optional suppression of the assistant turn-end footer
 // when the entry is an intermediate intro step directly preceding tool execution cards.
 func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *markdown.Options, canFork bool, showTurnFooter bool, onFork func(*ChatEntry)) {
+	RenderChatTurnEntryWithRevert(c, p, entry, mdOpts, canFork, showTurnFooter, onFork, nil)
+}
+
+// RenderChatTurnEntryWithRevert renders a ChatEntry with support for both session branching and per-tool file rollback.
+func RenderChatTurnEntryWithRevert(
+	c *ui.Context,
+	p Palette,
+	entry *ChatEntry,
+	mdOpts *markdown.Options,
+	canFork bool,
+	showTurnFooter bool,
+	onFork func(*ChatEntry),
+	onRevert func(*ChatEntry),
+) {
 	isRemote := entry.IsRemote || strings.Contains(entry.TargetBadge, "SSH") || strings.Contains(entry.TargetBadge, "🌐")
 
 	switch entry.Kind {
@@ -171,12 +221,33 @@ func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *mar
 		actionOp := turnWrap.Animate("u-act", targetOp, 140*time.Millisecond)
 
 		turnWrap.Children(func() {
+			// Multimodal attachment chips above or inside prompt bubble
+			if len(entry.Attachments) > 0 {
+				ui.Row(c).MaxWidth(580).Gap(6).Wrap().Justify(ui.End).Children(func() {
+					for _, att := range entry.Attachments {
+						ui.Row(c).Height(26).Padding(0, 8).Radius(RadiusSM).
+							Background(p.BgSurface).Border(1, p.BorderSubtle).Gap(6).AlignItems(ui.Center).Children(func() {
+							if att.Bitmap != nil {
+								ui.Image(c, att.Bitmap).Size(16, 16)
+							} else if att.IsImage {
+								ui.Icon(c, IconImage).Size(12.5, 12.5).TextColor(p.Accent)
+							} else {
+								ui.Icon(c, IconFileText).Size(12.5, 12.5).TextColor(p.TextMuted)
+							}
+							ui.Text(c, att.Name).Font(FontMono).FontSize(FontCaption).TextColor(p.TextSecondary).SingleLine()
+						})
+					}
+				})
+			}
+
 			// Asymmetric refined prompt bubble
-			ui.Column(c).MaxWidth(580).MinWidth(0).Padding(10, 14).
-				Radius(RadiusLG, RadiusLG, 4, RadiusLG).
-				Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
-				ui.Text(c, entry.Text).FontSize(FontBody).LineHeight(1.55).TextColor(p.TextPrimary).MinWidth(0).Selectable()
-			})
+			if strings.TrimSpace(entry.Text) != "" {
+				ui.Column(c).MaxWidth(580).MinWidth(0).Padding(10, 14).
+					Radius(RadiusLG, RadiusLG, 4, RadiusLG).
+					Background(p.BgElevated).Border(1, p.BorderSubtle).Children(func() {
+					ui.Text(c, entry.Text).FontSize(FontBody).LineHeight(1.55).TextColor(p.TextPrimary).MinWidth(0).Selectable()
+				})
+			}
 
 			// Quiet bottom-right metadata & hover-revealed actions
 			hasBadges := entry.Steered || (isRemote && entry.TargetBadge != "")
@@ -320,18 +391,23 @@ func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *mar
 				})
 			}
 
-			// Quiet Hover-Revealed Turn Actions (Copy / Fork) — omitted on intermediate steps before tool cards
+			// Quiet Hover-Revealed Turn Actions (Copy / Fork) + Subtle Token Usage Summary
 			if showTurnFooter && entry.Done && entry.Text != "" {
-				ui.Row(c).Height(22).Gap(3).AlignItems(ui.Center).Opacity(actionOp).Children(func() {
-					IconTipBtn(c, p, IconCopy, 22, 12.5, "复制回复", func() {
-						c.WriteClipboard(entry.Text)
-						c.Toast("已复制助手回复到剪贴板")
-					})
-					if canFork && onFork != nil && entry.EntryID != "" {
-						forkTip := fmt.Sprintf("从此处分叉会话 (#%s)", shortEntryID(entry.EntryID))
-						IconTipBtn(c, p, IconBranch, 22, 12.5, forkTip, func() {
-							onFork(entry)
+				ui.Row(c).Height(22).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Row(c).Gap(3).AlignItems(ui.Center).Opacity(actionOp).Children(func() {
+						IconTipBtn(c, p, IconCopy, 22, 12.5, "复制回复", func() {
+							c.WriteClipboard(entry.Text)
+							c.Toast("已复制助手回复到剪贴板")
 						})
+						if canFork && onFork != nil && entry.EntryID != "" {
+							forkTip := fmt.Sprintf("从此处分叉会话 (#%s)", shortEntryID(entry.EntryID))
+							IconTipBtn(c, p, IconBranch, 22, 12.5, forkTip, func() {
+								onFork(entry)
+							})
+						}
+					})
+					if usageLabel := formatTurnUsageSummary(entry); usageLabel != "" {
+						ui.Text(c, usageLabel).Font(FontMono).FontFeatures("tnum").FontSize(10.5).TextColor(p.TextMuted).SingleLine()
 					}
 				})
 			}
@@ -339,66 +415,129 @@ func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *mar
 
 	case EntryTool:
 		toolIcon, toolLabel := toolVisualMeta(entry.ToolName)
-		hasDiff := entry.DiffOld != "" || entry.DiffNew != ""
+		hasStructuredDiff := len(entry.DiffLines) > 0
+		hasDiff := hasStructuredDiff || entry.DiffOld != "" || entry.DiffNew != ""
 		hasBody := hasDiff || entry.ToolOutput != ""
 
 		ui.Column(c).FillWidth().MaxWidth(760).MinWidth(0).Radius(RadiusMD).
 			Background(p.BgSurface).Border(1, p.BorderSubtle).Clip().Children(func() {
-			// Compact Semantic Tool Header (34px)
-			hb := ui.ButtonBase(c).FillWidth().MinWidth(0).Height(34).Padding(0, 10).Gap(8).AlignItems(ui.Center)
-			targetBg := ui.Transparent
-			if hb.Hovered() || hb.Pressed() {
-				targetBg = p.BgHover
-			}
-			hb.Background(targetBg).Children(func() {
-				// Leading status / semantic icon
-				if entry.ToolRunning {
-					ui.Spinner(c).Size(13, 13)
-				} else if entry.ToolError {
-					ui.Icon(c, IconCross).Size(13.5, 13.5).TextColor(p.DangerColor).Shrink(0)
-				} else {
-					ui.Icon(c, toolIcon).Size(13.5, 13.5).TextColor(p.TextMuted).Shrink(0)
+			// Compact Semantic Tool Header (34px) — sibling Undo button avoids nested ButtonBase conflicts
+			ui.Row(c).FillWidth().MinWidth(0).Height(34).AlignItems(ui.Center).Children(func() {
+				hb := ui.ButtonBase(c).Grow(1).MinWidth(0).Height(34).Padding(0, 10).Gap(8).AlignItems(ui.Center)
+				targetBg := ui.Transparent
+				if hb.Hovered() || hb.Pressed() {
+					targetBg = p.BgHover
+				}
+				hb.Background(targetBg).Children(func() {
+					// Leading status / semantic icon
+					if entry.ToolRunning {
+						ui.Spinner(c).Size(13, 13)
+					} else if entry.ToolError {
+						ui.Icon(c, IconCross).Size(13.5, 13.5).TextColor(p.DangerColor).Shrink(0)
+					} else {
+						ui.Icon(c, toolIcon).Size(13.5, 13.5).TextColor(p.TextMuted).Shrink(0)
+					}
+
+					ui.Text(c, toolLabel).Font(FontMono).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).Shrink(0)
+
+					if entry.ToolSummary != "" {
+						ui.Text(c, singleLinePreview(entry.ToolSummary, 62)).
+							Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.TextMuted).
+							Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
+					} else {
+						ui.Spacer(c)
+					}
+
+					// +added / -removed line stats when diff was captured
+					if entry.DiffAdded > 0 || entry.DiffRemoved > 0 {
+						ui.Row(c).Gap(4).AlignItems(ui.Center).Shrink(0).Children(func() {
+							if entry.DiffAdded > 0 {
+								ui.Text(c, fmt.Sprintf("+%d", entry.DiffAdded)).
+									Font(FontMono).FontFeatures("tnum").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.DiffAddFg)
+							}
+							if entry.DiffRemoved > 0 {
+								ui.Text(c, fmt.Sprintf("-%d", entry.DiffRemoved)).
+									Font(FontMono).FontFeatures("tnum").FontWeight(WeightMedium).FontSize(FontCaption).TextColor(p.DiffDelFg)
+							}
+						})
+					}
+
+					// Remote SSH badge ONLY when remote (keeps local tool calls whisper-quiet)
+					if isRemote && entry.TargetBadge != "" {
+						ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Shrink(0).Gap(4).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, entry.TargetBadge).Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
+						})
+					}
+
+					if entry.Reverted {
+						ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.WarnSoft).Shrink(0).Children(func() {
+							ui.Text(c, "已撤销").FontSize(10).FontWeight(WeightMedium).TextColor(p.WarnColor)
+						})
+					} else if entry.ToolRunning {
+						ui.Text(c, "执行中").FontSize(FontCaption).TextColor(p.Accent).Shrink(0)
+					} else {
+						if entry.DurationMs > 0 {
+							ui.Text(c, fmt.Sprintf("%dms", entry.DurationMs)).
+								FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
+						}
+						if !entry.ToolError {
+							ui.Icon(c, IconCheck).Size(12, 12).TextColor(p.LocalColor).Shrink(0)
+						}
+					}
+
+					if hasBody {
+						chev := IconChevronRight
+						if entry.CardOpen {
+							chev = IconChevronDown
+						}
+						ui.Icon(c, chev).Size(12.5, 12.5).TextColor(p.TextMuted).Shrink(0)
+					}
+				})
+				if hb.Clicked() && hasBody {
+					entry.CardOpen = !entry.CardOpen
 				}
 
-				ui.Text(c, toolLabel).Font(FontMono).FontWeight(WeightMedium).FontSize(FontSmall).TextColor(p.TextPrimary).Shrink(0)
-
-				if entry.ToolSummary != "" {
-					ui.Text(c, singleLinePreview(entry.ToolSummary, 68)).
-						Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.TextMuted).
-						Grow(1).MinWidth(0).SingleLine().Ellipsis("...")
-				} else {
-					ui.Spacer(c)
-				}
-
-				// Remote SSH badge ONLY when remote (keeps local tool calls whisper-quiet)
-				if isRemote && entry.TargetBadge != "" {
-					ui.Row(c).Padding(1, 6).Radius(RadiusSM).Background(p.SSHSoft).Shrink(0).Gap(4).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, entry.TargetBadge).Font(FontMono).FontWeight(WeightMedium).FontSize(10).TextColor(p.SSHColor)
+				if entry.CardOpen && strings.TrimSpace(entry.ToolOutput) != "" {
+					ui.Row(c).Margin(0, 4, 0, 0).Shrink(0).Children(func() {
+						IconTipBtn(c, p, IconCopy, 24, 12.5, "复制工具输出内容", func() {
+							c.WriteClipboard(StripANSI(entry.ToolOutput))
+							c.Toast("已复制工具输出到剪贴板")
+						})
 					})
 				}
 
-				if entry.ToolRunning {
-					ui.Text(c, "执行中").FontSize(FontCaption).TextColor(p.Accent).Shrink(0)
-				} else {
-					if entry.DurationMs > 0 {
-						ui.Text(c, fmt.Sprintf("%dms", entry.DurationMs)).
-							FontFeatures("tnum").FontSize(FontCaption).TextColor(p.TextMuted).Shrink(0)
+				if entry.CanRevert && !entry.Reverted && !entry.ToolRunning && !entry.ToolError && canFork && onRevert != nil {
+					revBtn := ui.ButtonBase(c).Height(24).Padding(0, 8).Margin(0, 6, 0, 0).Radius(RadiusSM).
+						Border(1, p.BorderSubtle).Gap(4).AlignItems(ui.Center).Shrink(0).
+						Tooltip("一键回滚此次文件修改").Label("撤销修改")
+					revBg := p.InputBg
+					if revBtn.Hovered() || revBtn.Pressed() {
+						revBg = p.WarnSoft
 					}
-					if !entry.ToolError {
-						ui.Icon(c, IconCheck).Size(12, 12).TextColor(p.LocalColor).Shrink(0)
+					revBtn.Background(revBg).Children(func() {
+						ui.Icon(c, IconUndo).Size(11.5, 11.5).TextColor(p.TextSecondary)
+						ui.Text(c, "撤销").FontSize(FontCaption).FontWeight(WeightMedium).TextColor(p.TextSecondary).SingleLine()
+					})
+					if revBtn.Clicked() {
+						onRevert(entry)
 					}
-				}
-
-				if hasBody {
-					chev := IconChevronRight
-					if entry.CardOpen {
-						chev = IconChevronDown
-					}
-					ui.Icon(c, chev).Size(12.5, 12.5).TextColor(p.TextMuted).Shrink(0)
 				}
 			})
-			if hb.Clicked() && hasBody {
-				entry.CardOpen = !entry.CardOpen
+
+			// Compact Live Streaming Tail Preview while tool is running (replaces redundant side drawer!)
+			if entry.ToolRunning && !entry.CardOpen && strings.TrimSpace(entry.ToolOutput) != "" {
+				if tail, totalLines := TailLines(entry.ToolOutput, 5); tail != "" {
+					ui.Column(c).FillWidth().MinWidth(0).Padding(8, 12).Gap(3).
+						Background(p.CodeBg).BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
+						if totalLines > 5 {
+							ui.Textf(c, "… 实时输出尾部 (共 %d 行，点击卡片可展开完整日志)", totalLines).
+								FontSize(10).TextColor(p.TextMuted).SingleLine()
+						}
+						ui.Text(c, tail).
+							Font(FontMono).FontSize(FontCaption).LineHeight(1.45).TextColor(p.TextSecondary).
+							FillWidth().MinWidth(0).Selectable()
+					})
+				}
 			}
 
 			// Tool Card Body — Unified Single-Surface Code/Diff View (no multi-box nesting!)
@@ -406,7 +545,14 @@ func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *mar
 				ui.Column(c).FillWidth().MinWidth(0).Padding(10, 12).Gap(8).
 					Background(p.CodeBg).
 					BorderWidth(1, 0, 0, 0).BorderColor(p.BorderSubtle).Children(func() {
-					if hasDiff {
+					if hasStructuredDiff {
+						renderStructuredDiffLines(c, p, entry.DiffLines)
+						if entry.ToolError && entry.ToolOutput != "" {
+							ui.Text(c, truncatePreview(entry.ToolOutput, 400)).
+								Font(FontMono).FontSize(FontCaption).LineHeight(1.45).TextColor(p.DangerColor).
+								FillWidth().MinWidth(0).Selectable()
+						}
+					} else if hasDiff {
 						renderUnifiedDiffLines(c, p, entry.DiffOld, entry.DiffNew)
 						if entry.ToolOutput != "" {
 							outCol := p.TextMuted
@@ -430,6 +576,76 @@ func RenderChatTurnEntry(c *ui.Context, p Palette, entry *ChatEntry, mdOpts *mar
 			}
 		})
 	}
+}
+
+func formatTurnUsageSummary(entry *ChatEntry) string {
+	if entry == nil {
+		return ""
+	}
+	var parts []string
+	if entry.InputTokens > 0 || entry.OutputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("%s in · %s out", formatTokenCount(entry.InputTokens), formatTokenCount(entry.OutputTokens)))
+	}
+	if entry.CacheReadTokens > 0 {
+		parts = append(parts, fmt.Sprintf("cache %s", formatTokenCount(entry.CacheReadTokens)))
+	}
+	if entry.TurnDurationMs > 0 {
+		if entry.TurnDurationMs >= 1000 {
+			parts = append(parts, fmt.Sprintf("%.1fs", float64(entry.TurnDurationMs)/1000.0))
+		} else {
+			parts = append(parts, fmt.Sprintf("%dms", entry.TurnDurationMs))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+func renderStructuredDiffLines(c *ui.Context, p Palette, lines []harness.DiffLine) {
+	ui.Column(c).FillWidth().MinWidth(0).Radius(RadiusSM).
+		Border(1, p.BorderSubtle).Clip().Children(func() {
+		for _, dl := range lines {
+			switch dl.Kind {
+			case '@':
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Background(p.BgElevated).Children(func() {
+					ui.Text(c, dl.Text).Font(FontMono).FontSize(10.5).TextColor(p.TextMuted).SingleLine().Unselectable()
+				})
+			case '-':
+				lnStr := ""
+				if dl.OldLine > 0 {
+					lnStr = fmt.Sprintf("%4d", dl.OldLine)
+				}
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Background(p.DiffDelBg).Gap(8).Children(func() {
+					ui.Text(c, lnStr).Font(FontMono).FontFeatures("tnum").FontSize(10.5).TextColor(p.TextMuted).Width(30).Shrink(0).Unselectable()
+					ui.Text(c, "-").Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.DiffDelFg).Shrink(0).Unselectable()
+					ui.Text(c, dl.Text).Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.42).TextColor(p.DiffDelFg).
+						Grow(1).MinWidth(0).PreserveSpaces().Selectable()
+				})
+			case '+':
+				lnStr := ""
+				if dl.NewLine > 0 {
+					lnStr = fmt.Sprintf("%4d", dl.NewLine)
+				}
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Background(p.DiffAddBg).Gap(8).Children(func() {
+					ui.Text(c, lnStr).Font(FontMono).FontFeatures("tnum").FontSize(10.5).TextColor(p.TextMuted).Width(30).Shrink(0).Unselectable()
+					ui.Text(c, "+").Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.DiffAddFg).Shrink(0).Unselectable()
+					ui.Text(c, dl.Text).Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.42).TextColor(p.DiffAddFg).
+						Grow(1).MinWidth(0).PreserveSpaces().Selectable()
+				})
+			default:
+				lnStr := ""
+				if dl.NewLine > 0 {
+					lnStr = fmt.Sprintf("%4d", dl.NewLine)
+				} else if dl.OldLine > 0 {
+					lnStr = fmt.Sprintf("%4d", dl.OldLine)
+				}
+				ui.Row(c).FillWidth().MinWidth(0).Padding(2, 10).Gap(8).Children(func() {
+					ui.Text(c, lnStr).Font(FontMono).FontFeatures("tnum").FontSize(10.5).TextColor(p.TextMuted).Width(30).Shrink(0).Unselectable()
+					ui.Text(c, " ").Font(FontMono).FontSize(FontCaption + 0.5).TextColor(p.TextMuted).Shrink(0).Unselectable()
+					ui.Text(c, dl.Text).Font(FontMono).FontSize(FontCaption + 0.5).LineHeight(1.42).TextColor(p.TextSecondary).
+						Grow(1).MinWidth(0).PreserveSpaces().Selectable()
+				})
+			}
+		}
+	})
 }
 
 // renderUnifiedDiffLines renders old/new edit hunks in a single cohesive IDE-style diff view.
@@ -661,9 +877,14 @@ func SummarizeToolArgs(toolName string, args map[string]any) (summary, diffOld, 
 		}
 		return "工作区系统与 Git 状态探针", "", ""
 	default:
-		for _, k := range []string{"path", "command", "pattern", "subpath"} {
+		for _, k := range []string{"path", "command", "pattern", "subpath", "query", "url", "id"} {
 			if v, ok := args[k].(string); ok && v != "" {
 				return truncatePreview(v, 80), "", ""
+			}
+		}
+		if len(args) > 0 {
+			if raw, err := json.Marshal(args); err == nil && string(raw) != "{}" {
+				return singleLinePreview(string(raw), 72), "", ""
 			}
 		}
 		return "", "", ""
@@ -723,13 +944,14 @@ func RebuildEntriesFromProjected(projected []harness.ProjectedTurnMessage, nextI
 	for _, pm := range projected {
 		switch msg := pm.Message.(type) {
 		case ai.UserMessage:
-			txt := cleanUserMessageDisplay(ai.ContentText(msg.Content, "\n"))
-			if txt != "" {
+			txt, badges := extractUserDisplayAndBadges(msg.Content)
+			if txt != "" || len(badges) > 0 {
 				badge, rem := turnBadgeFor(pm, false)
 				out = append(out, &ChatEntry{
 					ID:            allocID(),
 					Kind:          EntryUser,
 					Text:          txt,
+					Attachments:   badges,
 					TargetBadge:   badge,
 					IsRemote:      rem,
 					Done:          true,
@@ -739,13 +961,14 @@ func RebuildEntriesFromProjected(projected []harness.ProjectedTurnMessage, nextI
 			}
 		case *ai.UserMessage:
 			if msg != nil {
-				txt := cleanUserMessageDisplay(ai.ContentText(msg.Content, "\n"))
-				if txt != "" {
+				txt, badges := extractUserDisplayAndBadges(msg.Content)
+				if txt != "" || len(badges) > 0 {
 					badge, rem := turnBadgeFor(pm, false)
 					out = append(out, &ChatEntry{
 						ID:            allocID(),
 						Kind:          EntryUser,
 						Text:          txt,
+						Attachments:   badges,
 						TargetBadge:   badge,
 						IsRemote:      rem,
 						Done:          true,
@@ -764,16 +987,22 @@ func RebuildEntriesFromProjected(projected []harness.ProjectedTurnMessage, nextI
 			}
 		case ai.ToolResultMessage:
 			if tc, ok := toolMap[msg.ToolCallID]; ok {
-				tc.ToolOutput = ai.ContentText(msg.Content, "\n")
+				tc.ToolOutput = StripANSI(ai.ContentText(msg.Content, "\n"))
 				tc.ToolError = msg.IsError
 				tc.ToolRunning = false
+				if msg.IsError {
+					tc.CardOpen = true
+				}
 			}
 		case *ai.ToolResultMessage:
 			if msg != nil {
 				if tc, ok := toolMap[msg.ToolCallID]; ok {
-					tc.ToolOutput = ai.ContentText(msg.Content, "\n")
+					tc.ToolOutput = StripANSI(ai.ContentText(msg.Content, "\n"))
 					tc.ToolError = msg.IsError
 					tc.ToolRunning = false
+					if msg.IsError {
+						tc.CardOpen = true
+					}
 				}
 			}
 		}
@@ -781,12 +1010,36 @@ func RebuildEntriesFromProjected(projected []harness.ProjectedTurnMessage, nextI
 	return out
 }
 
+func extractUserDisplayAndBadges(content ai.ContentList) (string, []ChatAttachmentBadge) {
+	var badges []ChatAttachmentBadge
+	imgCount := 0
+	for _, blk := range content {
+		if _, ok := blk.(ai.ImageContent); ok {
+			imgCount++
+		}
+	}
+	for idx := 0; idx < imgCount; idx++ {
+		badges = append(badges, ChatAttachmentBadge{
+			Name:    fmt.Sprintf("image-%d", idx+1),
+			IsImage: true,
+		})
+	}
+	txt := cleanUserMessageDisplay(ai.ContentText(content, "\n"))
+	return txt, badges
+}
+
 func cleanUserMessageDisplay(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "[System Notice: Active execution environment switched") {
 		if idx := strings.Index(s, "]\n\n"); idx != -1 {
-			return strings.TrimSpace(s[idx+3:])
+			s = strings.TrimSpace(s[idx+3:])
 		}
+	}
+	if strings.HasPrefix(s, "[Compacted Context Checkpoint]\n") {
+		return "📦 上下文压缩检查点已建立"
+	}
+	if idx := strings.Index(s, "\n\n[Attached Context:"); idx != -1 {
+		s = strings.TrimSpace(s[:idx])
 	}
 	return s
 }
@@ -811,16 +1064,25 @@ func appendAssistantMsg(out []*ChatEntry, am *ai.AssistantMessage, entryID, pare
 		}
 	}
 
+	var durMs int64
+	if am.DurationMs != nil {
+		durMs = *am.DurationMs
+	}
+
 	if len(textParts) > 0 || len(thinkParts) > 0 || am.ErrorMessage != "" {
 		out = append(out, &ChatEntry{
-			ID:            allocID(),
-			Kind:          EntryAssistant,
-			Text:          strings.Join(textParts, "\n\n"),
-			Thinking:      strings.Join(thinkParts, "\n"),
-			Done:          true,
-			ErrorText:     am.ErrorMessage,
-			EntryID:       entryID,
-			ParentEntryID: parentEntryID,
+			ID:              allocID(),
+			Kind:            EntryAssistant,
+			Text:            strings.Join(textParts, "\n\n"),
+			Thinking:        strings.Join(thinkParts, "\n"),
+			Done:            true,
+			ErrorText:       am.ErrorMessage,
+			EntryID:         entryID,
+			ParentEntryID:   parentEntryID,
+			InputTokens:     am.Usage.Input,
+			OutputTokens:    am.Usage.Output,
+			CacheReadTokens: am.Usage.CacheRead,
+			TurnDurationMs:  durMs,
 		})
 	}
 
